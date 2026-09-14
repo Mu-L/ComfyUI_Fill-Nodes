@@ -150,8 +150,7 @@ class FL_Audio_Separation:
             import traceback
             traceback.print_exc()
             print(f"{'='*60}\n")
-            # Return original audio for all outputs on error
-            return (audio, audio, audio, audio)
+            raise RuntimeError(f"FL Audio Separation failed: {e}") from e
 
     def _ensure_stereo(self, waveform: torch.Tensor) -> torch.Tensor:
         """Ensure waveform is stereo"""
@@ -196,32 +195,32 @@ class FL_Audio_Separation:
 
         batch, channels, length = mix.shape
 
-        chunk_len = int(sample_rate * segment * (1 + overlap))
+        chunk_len = round(sample_rate * segment)
+        overlap_frames = round(overlap * sample_rate)
+        if not 0 <= overlap_frames < chunk_len:
+            raise ValueError("Stem overlap must be shorter than the chunk length.")
         start = 0
         end = chunk_len
-        overlap_frames = overlap * sample_rate
         fade = Fade(
             fade_in_len=0,
             fade_out_len=int(overlap_frames),
             fade_shape=chunk_fade_shape
         )
 
-        final = torch.zeros(batch, len(model.sources), channels, length, device=device)
+        final = torch.zeros(batch, len(model.sources), channels, length, device=device, dtype=mix.dtype)
+        weights = torch.zeros(length, device=device, dtype=mix.dtype)
 
-        while start < length - overlap_frames:
+        while start < length:
+            end = min(length, start + chunk_len)
             chunk = mix[:, :, start:end]
-            with torch.no_grad():
-                out = model.forward(chunk)
-            out = fade(out)
-            final[:, :, :, start:end] += out
+            out = model(chunk)
+            fade.fade_in_len = min(overlap_frames, end - start) if start else 0
+            fade.fade_out_len = min(overlap_frames, end - start) if end < length else 0
+            weight = fade(torch.ones(end - start, device=device, dtype=mix.dtype))
+            final[..., start:end].add_(out * weight)
+            weights[start:end].add_(weight)
+            if end == length:
+                break
+            start += chunk_len - overlap_frames
 
-            if start == 0:
-                fade.fade_in_len = int(overlap_frames)
-                start += int(chunk_len - overlap_frames)
-            else:
-                start += chunk_len
-            end += chunk_len
-            if end >= length:
-                fade.fade_out_len = 0
-
-        return final
+        return final / weights.clamp_min(1e-8)

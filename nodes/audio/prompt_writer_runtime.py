@@ -40,6 +40,7 @@ from .prompt_writer_images import (
     normalize_prompt_writer_attachments,
 )
 from .prompt_writer_store import PromptWriterStore, prompt_writer_store
+from .prompt_storyboard_actions import STORYBOARD_SCHEMA, REFERENCE_ASSIGNMENT_SCHEMA, normalize_storyboard_actions, normalize_reference_assignments, normalize_asset_ids
 
 
 logger = logging.getLogger("fl_fill_nodes.prompt_writer")
@@ -51,6 +52,8 @@ CLAUDE_MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 STRUCTURED_RESULT_SCHEMA = {
     "type": "object",
     "properties": {
+        "storyboards": STORYBOARD_SCHEMA,
+        "reference_assignments": REFERENCE_ASSIGNMENT_SCHEMA,
         "target_indices": {
             "type": "array",
             "maxItems": MAX_BOXES,
@@ -77,7 +80,7 @@ STRUCTURED_RESULT_SCHEMA = {
             "description": "A concise conversational response explaining the result.",
         },
     },
-    "required": ["target_indices", "updates", "assistant"],
+    "required": ["target_indices", "updates", "assistant", "storyboards", "reference_assignments"],
     "additionalProperties": False,
 }
 
@@ -118,6 +121,7 @@ def _normalize_document(value):
             allow_empty=True,
         ),
         "boxes": _normalize_boxes(value.get("boxes")),
+        "reference_assets": normalize_asset_ids(value.get("reference_assets", [])),
     }
 
 
@@ -205,6 +209,11 @@ def _structured_prompt(document, messages, vision_images=None):
 
 def _structured_system_prompt(guide_mode):
     return (
+        "Request storyboard reference generation using the storyboards array when asked. "
+        "The host queues paid contact sheets automatically after your response and attaches their panels to the timeline. Do not claim images have finished yet. "
+        "Use chronological panel beats, consistent identity and no text in the image. "
+        "You can also assign reference_assignments from supplied library IDs directly to scoped sections. "
+        "Prefer a 2x2 grid for up to six seconds and 3x3 for longer sections. Use only supplied box indices. "
         "You are Beat Writer, a prompt-writing agent embedded in an audio beat prompt scheduler. "
         "You may work only on the prompt boxes supplied with the current request. Never change or "
         "invent timing, frame ranges, fades, render groups, audio settings, nodes, files, or workflow "
@@ -269,6 +278,19 @@ def _parse_structured_result(value):
     if not isinstance(target_indices, list):
         raise PromptWriterProviderError("The provider structured output has an invalid edit plan.")
     return assistant.strip(), updates, target_indices
+
+
+def _structured_actions(value, document):
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        value = json.loads(text)
+    indices = {box["index"] for box in document["boxes"]}
+    return {
+        "storyboards": normalize_storyboard_actions(value.get("storyboards", []), indices),
+        "reference_assignments": normalize_reference_assignments(value.get("reference_assignments", []), indices, document["reference_assets"]),
+    }
 
 
 def _native_claude_cli(path):
@@ -780,9 +802,12 @@ class PromptWriterRuntime:
             "song_context": run.document["song_context"],
             "lyrics_context": run.document["lyrics_context"],
             "boxes": run.document["boxes"],
+            "reference_assets": run.document["reference_assets"],
         }, on_text_delta=on_text_delta, on_tool_event=on_tool_event, on_prompt_progress=on_prompt_progress,
             vision_images=vision_images)
         return result["assistant"], result["updates"], {
+            "storyboards": result.get("storyboards", []),
+            "reference_assignments": result.get("reference_assignments", []),
             "toolCalls": result["tool_calls"],
             "_target_indices": result["target_indices"],
             "_tools_published": True,
@@ -811,6 +836,7 @@ class PromptWriterRuntime:
         text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
         assistant, updates, target_indices = _parse_structured_result(text)
         return assistant, updates, {
+            **_structured_actions(text, run.document),
             "usage": getattr(response, "usage", None).model_dump() if response.usage else {},
             "_target_indices": target_indices,
         }
@@ -874,7 +900,7 @@ class PromptWriterRuntime:
         if result is None:
             raise PromptWriterProviderError("Claude subscription returned no result.")
         assistant, updates, target_indices = _parse_structured_result(result)
-        return assistant, updates, {"_target_indices": target_indices}
+        return assistant, updates, {"_target_indices": target_indices, **_structured_actions(result, run.document)}
 
     async def _run_codex(self, run, messages):
         from openai_codex import ApprovalMode, AsyncCodex, CodexConfig, Sandbox
@@ -974,7 +1000,7 @@ class PromptWriterRuntime:
             detail = completed_turn.error.message if completed_turn.error else "Codex turn failed."
             raise PromptWriterProviderError(detail)
         assistant, updates, target_indices = _parse_structured_result(completed_text)
-        return assistant, updates, {"usage": usage, "_target_indices": target_indices}
+        return assistant, updates, {"usage": usage, "_target_indices": target_indices, **_structured_actions(completed_text, run.document)}
 
 
 prompt_writer_runtime = PromptWriterRuntime()

@@ -80,6 +80,7 @@ app.registerExtension({
       analysisSource: findWidget(node, "analysis_source"),
       beatGridDensity: findWidget(node, "beat_grid_density"),
       renderGroups: findWidget(node, "render_groups"),
+      referenceSchedule: findWidget(node, "reference_schedule"),
       analysisCacheKey: findWidget(node, "analysis_cache_key"),
       envelopeLayers: findWidget(node, "envelope_layers"),
     };

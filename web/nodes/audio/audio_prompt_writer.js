@@ -1,18 +1,12 @@
 import { PromptWriterClient } from "./audio_prompt_writer_client.js";
 import { renderWriterMarkdown } from "./audio_prompt_writer_markdown.js";
+import { mountStoryboards } from "./audio_prompt_storyboards.js";
 
 const NODE_DEFAULTS = {
   guideMode: "video_prompt_guide",
   scope: "all",
   context: "",
 };
-
-const STARTERS = [
-  ["Rewrite with the guide", "Rewrite every prompt box using the complete packaged prompt-writing guide while preserving the story and timing."],
-  ["Strengthen continuity", "Strengthen visual and narrative continuity across these prompt boxes. Keep each beat distinct and actionable."],
-  ["Make action explicit", "Make the physical action, camera behavior, and scene construction more explicit in every prompt that needs it."],
-  ["Review first", "Review the current prompt sequence for continuity, clarity, and guide compliance. Do not edit anything yet."],
-];
 
 const MAX_CHAT_ATTACHMENTS = 8;
 const MAX_CHAT_ATTACHMENT_BYTES = 32 * 1024 * 1024;
@@ -33,6 +27,8 @@ function nodeSettings(node) {
       schedulerId: saved.schedulerId,
     } : {}),
     schedulerId: saved?.schedulerId || createId(),
+    moodboards: Array.from({ length: 4 }, (_, index) => saved?.moodboards?.[index] || null),
+    storyboardResults: Array.isArray(saved?.storyboardResults) ? saved.storyboardResults : [],
   };
 }
 
@@ -74,6 +70,8 @@ export class BeatPromptWriter {
     this.nodeSettings = nodeSettings(node);
     this.settings = null;
     this.status = null;
+    this.models = [];
+    this.modelRequest = 0;
     this.conversations = [];
     this.archivedConversations = [];
     this.conversationId = null;
@@ -106,6 +104,7 @@ export class BeatPromptWriter {
     };
     this.destroyed = false;
     this.build();
+    mountStoryboards(this);
     this.saveNodeSettings();
     this.initialize();
   }
@@ -140,12 +139,6 @@ export class BeatPromptWriter {
       <section class="flbps-writer-view active" data-writer-view="chat">
         <div class="flbps-writer-banner" data-writer-role="status" aria-live="polite"><i></i><span>Connecting...</span></div>
         <div class="flbps-writer-messages" data-writer-role="messages">
-          <section class="flbps-writer-welcome" data-writer-role="welcome">
-            <div class="flbps-writer-welcome-mark">W</div>
-            <h3>Write the whole sequence together.</h3>
-            <p>Chat about the story, review the timeline, or ask Beat Writer to revise prompt boxes with the complete guide.</p>
-            <div class="flbps-writer-starters" data-writer-role="starters"></div>
-          </section>
           <div class="flbps-writer-thread" data-writer-role="thread"></div>
         </div>
         <button class="flbps-writer-jump" data-writer-action="jump-latest" hidden>Jump to latest <span>down</span></button>
@@ -183,8 +176,9 @@ export class BeatPromptWriter {
           <details class="flbps-writer-settings-card" open><summary><span>Connection</span><em data-writer-role="connection-pill">Checking</em></summary><div>
             <label>Provider<select data-writer-setting="provider"></select></label>
             <label data-writer-role="base-url-row">Base URL<input data-writer-setting="base-url" type="url" spellcheck="false"></label>
-            <label>Model<div class="flbps-writer-inline"><input data-writer-setting="model" type="text" list="flbps-writer-models" spellcheck="false"><button data-writer-action="models">Refresh</button></div></label>
+            <label>Model<div class="flbps-writer-inline"><select data-writer-setting="model-select" aria-label="Subscription model" hidden></select><input data-writer-setting="model" type="text" list="flbps-writer-models" spellcheck="false"><button data-writer-action="models">Refresh</button></div></label>
             <datalist id="flbps-writer-models"></datalist>
+            <p class="flbps-writer-scope-note" data-writer-role="model-status" aria-live="polite"></p>
             <label>Default reasoning<select data-writer-setting="reasoning"></select></label>
             <div class="flbps-writer-setting-row"><label>Temperature<input data-writer-setting="temperature" type="number" min="0" max="2" step="0.1"></label><label>Max tokens<input data-writer-setting="max-tokens" type="number" min="256" max="32768" step="256"></label></div>
             <label data-writer-role="credential-row">API key<div class="flbps-writer-inline"><input data-writer-setting="credential" type="password" autocomplete="off" placeholder="Stored in your OS keychain"><button data-writer-action="clear-credential">Clear</button></div></label>
@@ -194,7 +188,7 @@ export class BeatPromptWriter {
           <details class="flbps-writer-settings-card" open><summary><span>Writing</span><em>Prompt-only</em></summary><div>
             <label>Prompt guide<select data-writer-node-setting="guide-mode"><option value="video_prompt_guide">Complete packaged guide</option><option value="preserve">Preserve current format</option><option value="freeform">Freeform with guide reference</option></select></label>
             <label>Story bible / persistent context<textarea data-writer-node-setting="context" placeholder="Characters, style rules, continuity, and story intent"></textarea></label>
-            <p class="flbps-writer-scope-note">Beat Writer can inspect attached reference images and replace prompt text in the selected scope. Images stay read-only; it cannot change timing, nodes, files, or workflow structure.</p>
+            <p class="flbps-writer-scope-note">Beat Writer can inspect attached images and checked moodboards, replace scoped prompts, and generate storyboard references. Generation uses ComfyUI credits and attaches panels automatically. Reference Library wiring is added when needed; timing stays unchanged.</p>
           </div></details>
         </div>
       </section>
@@ -221,7 +215,6 @@ export class BeatPromptWriter {
     this.container.appendChild(this.root);
     this.messagesElement = this.root.querySelector('[data-writer-role="messages"]');
     this.threadElement = this.root.querySelector('[data-writer-role="thread"]');
-    this.welcomeElement = this.root.querySelector('[data-writer-role="welcome"]');
     this.statusElement = this.root.querySelector('[data-writer-role="status"]');
     this.statusText = this.statusElement.querySelector("span");
     this.composer = this.root.querySelector('[data-writer-role="composer"]');
@@ -238,6 +231,8 @@ export class BeatPromptWriter {
     this.providerSelect = this.root.querySelector('[data-writer-setting="provider"]');
     this.baseUrlInput = this.root.querySelector('[data-writer-setting="base-url"]');
     this.modelInput = this.root.querySelector('[data-writer-setting="model"]');
+    this.modelSelect = this.root.querySelector('[data-writer-setting="model-select"]');
+    this.modelStatus = this.root.querySelector('[data-writer-role="model-status"]');
     this.modelOptions = this.root.querySelector("#flbps-writer-models");
     this.reasoningSelect = this.root.querySelector('[data-writer-setting="reasoning"]');
     this.temperatureInput = this.root.querySelector('[data-writer-setting="temperature"]');
@@ -253,20 +248,15 @@ export class BeatPromptWriter {
     this.nodeControls.scope.value = this.nodeSettings.scope;
     this.nodeControls.guideMode.value = this.nodeSettings.guideMode;
     this.nodeControls.context.value = this.nodeSettings.context;
-    const starters = this.root.querySelector('[data-writer-role="starters"]');
-    for (const [label, prompt] of STARTERS) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.dataset.writerAction = "starter";
-      button.dataset.prompt = prompt;
-      button.textContent = label;
-      starters.appendChild(button);
-    }
 
     this.root.addEventListener("click", (event) => {
       this.handleAction(event).catch((error) => this.showError(error.message));
     });
     this.providerSelect.addEventListener("change", () => this.applyProviderPreset());
+    this.modelSelect.addEventListener("change", () => {
+      this.modelInput.value = this.modelSelect.value;
+      this.populateReasoning(this.reasoningSelect.value);
+    });
     for (const [name, control] of Object.entries(this.nodeControls)) {
       control.addEventListener(name === "context" ? "input" : "change", () => {
         this.nodeSettings[name] = control.value;
@@ -324,6 +314,7 @@ export class BeatPromptWriter {
       if (this.destroyed) return;
       this.populateSettings();
       this.updateProviderBadge();
+      this.discoverModels(false);
       await this.refreshConversations();
       const resumed = await this.resumeActiveRun();
       if (!resumed && this.errorElement.hidden) {
@@ -508,10 +499,6 @@ export class BeatPromptWriter {
     else if (action === "toggle-menu") {
       const menu = this.root.querySelector('[data-writer-role="menu"]');
       menu.hidden = !menu.hidden;
-    } else if (action === "starter") {
-      this.composer.value = button.dataset.prompt || "";
-      this.updateComposer();
-      this.composer.focus();
     } else if (action === "send") await this.send();
     else if (action === "attach-images") this.attachmentInput.click();
     else if (action === "remove-attachment") this.removePendingAttachment(Number(button.dataset.attachmentIndex));
@@ -567,7 +554,8 @@ export class BeatPromptWriter {
 
   populateReasoning(selected) {
     const preset = this.settings?.presets?.[this.providerSelect.value] || {};
-    const efforts = ["default", ...(preset.reasoning_efforts || [])];
+    const model = this.models.find((item) => item.id === this.modelInput.value);
+    const efforts = ["default", ...(model?.reasoningEfforts || preset.reasoning_efforts || [])];
     for (const select of [this.reasoningSelect, this.reasoningComposer]) {
       select.replaceChildren(...efforts.map((effort) => option(effort, effort === "default" ? "Default" : effort[0].toUpperCase() + effort.slice(1))));
       select.value = efforts.includes(selected) ? selected : "default";
@@ -575,16 +563,22 @@ export class BeatPromptWriter {
   }
 
   applyProviderPreset() {
+    this.modelRequest += 1;
+    this.models = [];
     const preset = this.settings.presets[this.providerSelect.value];
     this.baseUrlInput.value = preset.base_url || "";
     this.modelInput.value = preset.default_model || "";
     this.populateReasoning("default");
     this.updateProviderControls();
+    this.discoverModels(false);
   }
 
   updateProviderControls() {
     const preset = this.settings.presets[this.providerSelect.value];
     const subscription = ["codex_cli", "claude_cli"].includes(preset.type);
+    this.modelInput.hidden = subscription;
+    this.modelSelect.hidden = !subscription;
+    this.renderModelOptions();
     this.root.querySelector('[data-writer-role="base-url-row"]').hidden = preset.type !== "openai_compatible";
     this.root.querySelector('[data-writer-role="credential-row"]').hidden = subscription || (!preset.requires_key && this.providerSelect.value !== "custom");
     this.root.querySelector('[data-writer-role="subscription-row"]').hidden = !subscription;
@@ -620,11 +614,41 @@ export class BeatPromptWriter {
     this.toast("Stored credential cleared");
   }
 
+  renderModelOptions() {
+    const selected = this.modelInput.value;
+    const choices = this.models.map((model) => option(model.id, model.label || model.id));
+    this.modelOptions.replaceChildren(...this.models.map((model) => option(model.id, model.label || model.id)));
+    if (selected && !this.models.some((model) => model.id === selected)) {
+      choices.unshift(option(selected, `${selected} (current selection; not in loaded list)`));
+    }
+    if (!selected) choices.unshift(option("", "Choose a model"));
+    this.modelSelect.replaceChildren(...choices);
+    this.modelSelect.value = selected;
+  }
+
   async discoverModels(showStatus = true) {
-    const result = await this.client.models(true);
-    this.modelOptions.replaceChildren(...(result.models || []).map((model) => option(model.id, model.label || model.id)));
-    if (!this.modelInput.value && result.models?.length) this.modelInput.value = result.models[0].id;
-    if (showStatus) this.toast(`${result.models?.length || 0} models found`, "success");
+    const request = ++this.modelRequest;
+    const provider = this.providerSelect.value;
+    if (provider !== this.settings.provider) {
+      this.modelStatus.textContent = "Save the provider connection to load its available models.";
+      return;
+    }
+    this.modelStatus.textContent = "Loading available models…";
+    try {
+      const result = await this.client.models(showStatus);
+      if (this.destroyed || request !== this.modelRequest || provider !== this.providerSelect.value) return;
+      this.models = result.models || [];
+      this.renderModelOptions();
+      this.populateReasoning(this.reasoningSelect.value);
+      this.modelStatus.textContent = this.models.length
+        ? `${this.models.length} models available. Choose a model, then Save connection.`
+        : "No models returned. Check the connection or sign-in, then Refresh. Current selection kept.";
+      if (showStatus) this.toast(this.modelStatus.textContent, this.models.length ? "success" : "error");
+    } catch (error) {
+      if (this.destroyed || request !== this.modelRequest || provider !== this.providerSelect.value) return;
+      this.modelStatus.textContent = `Could not load models: ${error.message}. Current selection kept; try Refresh.`;
+      if (showStatus) this.toast(this.modelStatus.textContent, "error");
+    }
   }
 
   async subscriptionAction(action) {
@@ -632,6 +656,7 @@ export class BeatPromptWriter {
     const result = await this.client.subscription(provider, action);
     this.root.querySelector('[data-writer-role="subscription-status"]').textContent = result.message || "Status refreshed.";
     if (action === "refresh") this.settings.credential = result;
+    if (action === "refresh") await this.discoverModels();
     this.toast(result.message || "Subscription status refreshed");
   }
 
@@ -888,7 +913,6 @@ export class BeatPromptWriter {
     this.threadElement.replaceChildren();
     this.currentAssistant = null;
     this.activeTools.clear();
-    this.welcomeElement.hidden = messages.length > 0;
     for (const message of messages) this.appendPersistedMessage(message);
     this.scrollToBottom(true);
   }
@@ -909,7 +933,6 @@ export class BeatPromptWriter {
   }
 
   createMessage(role, content = "", message = {}) {
-    this.welcomeElement.hidden = true;
     const article = document.createElement("article");
     article.className = `flbps-writer-message ${role}`;
     const meta = document.createElement("header");
@@ -1229,6 +1252,11 @@ export class BeatPromptWriter {
         : this.pendingAttachments;
     }
     attachments = attachments.map((attachment) => ({ ...attachment }));
+    const visionAttachments = [...new Map([...attachments, ...this.nodeSettings.moodboards.filter(board => board?.selected)].map(image => [`${image.subfolder}/${image.filename}`, image])).values()];
+    if (visionAttachments.length > MAX_CHAT_ATTACHMENTS) {
+      this.showError(`Use at most ${MAX_CHAT_ATTACHMENTS} images total across chat attachments and checked moodboards.`);
+      return;
+    }
     if (!text && !attachments.length) return;
     if (!this.status?.configured) {
       this.showView("settings");
@@ -1247,6 +1275,13 @@ export class BeatPromptWriter {
       return;
     }
     this.currentDocument = document;
+    this.editor.serialize();
+    document.sectionIds = Object.fromEntries(document.allowed_indices.map(index => [index, this.editor.clips[index].sectionId]));
+    document.referenceSelections = Object.fromEntries(document.allowed_indices.map(index => [index, structuredClone(this.editor.clips[index].references)]));
+    const referenceContext = {
+      assets: Object.entries(this.editor.referenceAssets || {}).map(([id, asset]) => ({ id, kind: asset.kind, label: asset.label || asset.filename })),
+      sections: document.allowed_indices.map(index => ({ index, ...this.editor.clips[index].references })),
+    };
     if (!editMessageId) {
       this.composer.value = "";
       this.pendingAttachments = [];
@@ -1280,10 +1315,11 @@ export class BeatPromptWriter {
         conversation_id: this.conversationId,
         edit_message_id: editMessageId,
         message: text,
-        attachments,
+        attachments: visionAttachments,
+        reference_assets: referenceContext.assets.map(asset => asset.id),
         reasoning_effort: this.reasoningComposer.value,
         guide_mode: this.nodeSettings.guideMode,
-        writer_context: this.nodeSettings.context,
+        writer_context: this.nodeSettings.context + "\nRead-only section reference library (Picture and Video tags each start at 1 per section, ordered within each media type; selections replace defaults; Audio numbering also includes paired video sound and the timeline song): " + JSON.stringify(referenceContext) + "\nMoodboards selected for storyboard generation: " + this.nodeSettings.moodboards.map((board, index) => board?.selected ? `${index+1}: ${board.label}; role: ${board.role}` : "").filter(Boolean).join("; "),
         ...document,
       }, (event) => this.handleRunEvent(event));
     } catch (error) {
@@ -1453,6 +1489,10 @@ export class BeatPromptWriter {
       });
       this.setStatus("Stopped / no prompt changes were applied", "ready");
     } else if (event.type === "run_finished") {
+      if (event.assistantMessage?.metadata?.storyboards?.length) this.generateStoryboards(event.assistantMessage.metadata.storyboards, event.assistantMessage.metadata.updates, event.assistantMessage.id);
+      const storyboardIndices = new Set((event.assistantMessage?.metadata?.storyboards || []).map(action => action.index));
+      const assignments = (event.assistantMessage?.metadata?.reference_assignments || []).filter(action => !storyboardIndices.has(action.index));
+      if (assignments.length) this.applyReferenceAssignments(assignments, event.assistantMessage.metadata.updates);
       this.finishAssistantMessage();
       if (!["applied", "complete", "no_changes", "error", "stopped"].includes(this.writerActivity.phase)) {
         this.updateWriterActivity("complete", "Response complete", { targetIndices: [] });
@@ -1545,6 +1585,7 @@ export class BeatPromptWriter {
   }
 
   destroy() {
+    this.disposeStoryboards?.();
     this.destroyed = true;
     this.client.detach();
     this.editor.clearWriterActivity?.();

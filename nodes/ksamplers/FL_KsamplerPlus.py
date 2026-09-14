@@ -2,6 +2,7 @@ import copy
 import torch
 import math
 from nodes import common_ksampler, VAEDecode, VAEEncode
+import comfy.sample
 import comfy.samplers
 import comfy.utils
 import logging
@@ -170,8 +171,10 @@ class FL_KsamplerPlus:
             if use_sliced_conditioning:
                 batch_size = 1
 
-            # Handle variable tensor dimensions (4D or 5D)
-            latent_samples = latent_image["samples"]
+            # Resolve the model's native latent layout before sizing the tiles and canvas.
+            latent_samples = comfy.sample.fix_empty_latent_channels(
+                model, latent_image["samples"], latent_image.get("downscale_ratio_spacial"),
+                latent_image.get("downscale_ratio_temporal"))
             primary_samples = primary_tensor(latent_samples)
             if latent_samples.is_nested:
                 batch_size = 1
@@ -228,7 +231,7 @@ class FL_KsamplerPlus:
                 if primary_noise_mask is not None and is_video:
                     if primary_noise_mask.shape[-1] > 1 and primary_noise_mask.shape[-2] > 1:
                         # Spatially varying mask — slice to match tile
-                        sliced_noise_mask = primary_noise_mask[:, :, :, y_start:y_end, x_start:x_end]
+                        sliced_noise_mask = primary_noise_mask[..., y_start:y_end, x_start:x_end]
                     else:
                         # Spatially uniform (e.g., [B,1,T,1,1]) — pass as-is
                         sliced_noise_mask = primary_noise_mask

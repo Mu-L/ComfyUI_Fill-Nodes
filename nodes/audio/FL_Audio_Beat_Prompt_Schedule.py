@@ -3,6 +3,7 @@ import math
 import re
 
 from comfy_api.latest import io
+from .prompt_references import reference_document, apply_reference_sections, reference_file_fingerprint
 
 from .audio_files import (
     audio_file_hash,
@@ -199,6 +200,8 @@ def _source_events(
     if use_full_analysis:
         data = source_analysis
         if source in {"beat_grid", "downbeat", "raw_beat"}:
+            if not source_analysis.get("base_beat_times", source_analysis.get("beat_times", [])):
+                return []
             data = apply_beat_offset(
                 apply_half_time(source_analysis, half_time),
                 fps,
@@ -286,13 +289,13 @@ def _parse_beat_payload(beat_positions):
         raise ValueError(f"Beat positions is not valid JSON: {error.msg}.") from error
 
 
-def _load_beat_data(beat_positions):
+def _load_beat_data(beat_positions, allow_empty=False):
     data = _parse_beat_payload(beat_positions)
     if not isinstance(data, dict):
         raise ValueError("Beat positions must be the JSON object from FL Audio BPM Analyzer.")
 
     values = data.get("beat_times")
-    if not isinstance(values, list) or not values:
+    if not isinstance(values, list) or (not values and not allow_empty):
         raise ValueError("Beat positions must contain a non-empty beat_times list.")
 
     beat_times = []
@@ -305,7 +308,7 @@ def _load_beat_data(beat_positions):
     duration = _number(data.get("audio_duration"), "audio_duration", 0)
     if duration <= 0:
         raise ValueError("Beat positions audio_duration must be greater than zero.")
-    if beat_times[-1] > duration + _EPS:
+    if beat_times and beat_times[-1] > duration + _EPS:
         raise ValueError("Beat positions contains a beat after audio_duration.")
 
     bpm = _number(data.get("bpm", 0.0), "bpm", 0)
@@ -726,6 +729,9 @@ def _frame_sections(sections, fps, total_frames):
         }
         if "render_group" in section:
             frame_section["render_group"] = section["render_group"]
+        for key in ("section_id", "references"):
+            if key in section:
+                frame_section[key] = section[key]
         frame_sections.append(frame_section)
     return frame_sections
 
@@ -903,6 +909,8 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
                         "the three fixed envelope slots automatically."
                     ),
                 ),
+                io.String.Input("reference_schedule", default="", optional=True,
+                                tooltip="Sequencer-owned section references and asset manifest."),
             ],
             outputs=[
                 FLPromptSchedule.Output(
@@ -960,6 +968,7 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
         render_groups="",
         analysis_cache_key="",
         envelope_layers="",
+        reference_schedule="",
     ):
         internal_analysis = None
         cropped_audio = None
@@ -980,15 +989,16 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
             )
         if beat_positions:
             beat_payload = _parse_beat_payload(beat_positions)
-            _load_beat_data(beat_payload)
-            beat_payload = apply_beat_offset(
-                beat_payload,
-                fps,
-                beat_offset_ms,
-                beat_grid_density,
-            )
+            _load_beat_data(beat_payload, allow_empty=time_unit != "beats")
+            if beat_payload.get("base_beat_times", beat_payload.get("beat_times", [])):
+                beat_payload = apply_beat_offset(
+                    beat_payload,
+                    fps,
+                    beat_offset_ms,
+                    beat_grid_density,
+                )
             beat_positions = json.dumps(beat_payload, separators=(",", ":"))
-            beat_data = _load_beat_data(beat_payload)
+            beat_data = _load_beat_data(beat_payload, allow_empty=time_unit != "beats")
             if internal_analysis is not None:
                 difference = abs(beat_data["audio_duration"] - internal_analysis["audio_duration"])
                 if difference > max(_EPS, 1.0 / fps):
@@ -998,7 +1008,7 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
                     )
         elif internal_analysis is not None:
             beat_positions = json.dumps(internal_analysis, separators=(",", ":"))
-            beat_data = _load_beat_data(beat_positions)
+            beat_data = _load_beat_data(beat_positions, allow_empty=time_unit != "beats")
         else:
             raise ValueError("Choose an audio file or connect beat_positions.")
 
@@ -1028,6 +1038,8 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
             ),
             render_groups,
         )
+        references = reference_document(reference_schedule, len(parsed_sections))
+        apply_reference_sections(parsed_sections, references)
         sections = _resolve_schedule(
             parsed_sections,
             beat_times,
@@ -1062,6 +1074,7 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
             "source_unit": time_unit,
             "fps": fps,
             "sections": sections,
+            "reference_assets": references["assets"],
         }
         ui_payload = {
             "bpm": beat_data["bpm"],
@@ -1153,15 +1166,17 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
         audio_file="",
         analysis_cache_key="",
         beat_positions=None,
+        reference_schedule="",
         **kwargs,
     ):
+        references = reference_file_fingerprint(reference_schedule)
         if not audio_file and analysis_cache_key:
             audio_file = cached_analysis_audio_file(analysis_cache_key)
         if not audio_file:
-            return None
+            return (None, references)
         analysis_version = (
             f"audio-timeline-{ANALYSIS_VERSION}"
             if beat_positions
             else f"{DETECTOR_VERSION}:timeline-{ANALYSIS_VERSION}"
         )
-        return f"{analysis_version}:{audio_file_hash(resolve_audio_path(audio_file))}"
+        return (f"{analysis_version}:{audio_file_hash(resolve_audio_path(audio_file))}", references)

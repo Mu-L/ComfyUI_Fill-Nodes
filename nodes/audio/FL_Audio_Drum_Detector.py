@@ -28,21 +28,25 @@ class FL_Audio_Drum_Detector:
                     "min": 0.0,
                     "max": 1.0,
                     "step": 0.05,
-                    "description": "Kick detection sensitivity (lower = more sensitive)"
+                    "description": "Kick detection sensitivity (higher = more sensitive)"
                 }),
                 "snare_sensitivity": ("FLOAT", {
                     "default": 0.5,
                     "min": 0.0,
                     "max": 1.0,
                     "step": 0.05,
-                    "description": "Snare detection sensitivity (lower = more sensitive)"
+                    "description": "Snare detection sensitivity (higher = more sensitive)"
                 }),
                 "hihat_sensitivity": ("FLOAT", {
                     "default": 0.5,
                     "min": 0.0,
                     "max": 1.0,
                     "step": 0.05,
-                    "description": "Hi-hat detection sensitivity (lower = more sensitive)"
+                    "description": "Hi-hat detection sensitivity (higher = more sensitive)"
+                }),
+                "detection_mode": (["classified_onsets", "independent_bands"], {
+                    "default": "classified_onsets",
+                    "description": "Independent bands detect low/mid/high transients separately for dense full mixes; these are frequency accents, not isolated instrument labels."
                 }),
             }
         }
@@ -52,7 +56,8 @@ class FL_Audio_Drum_Detector:
         audio: Dict[str, Any],
         kick_sensitivity: float = 0.5,
         snare_sensitivity: float = 0.5,
-        hihat_sensitivity: float = 0.5
+        hihat_sensitivity: float = 0.5,
+        detection_mode: str = "classified_onsets"
     ) -> Tuple[str]:
         """
         Detect drum elements from audio
@@ -95,6 +100,25 @@ class FL_Audio_Drum_Detector:
 
             print(f"[FL Audio Drum Detector] DEBUG: Waveform shape = {waveform_np.shape}")
             print(f"[FL Audio Drum Detector] DEBUG: Sample rate = {sample_rate}")
+
+            if detection_mode == "independent_bands":
+                spectrum = np.abs(librosa.stft(waveform_np))
+                frequencies = librosa.fft_frequencies(sr=sample_rate)
+                data = {"sample_rate": int(sample_rate), "duration": float(len(waveform_np) / sample_rate),
+                        "detection_mode": "independent_bands"}
+                for name, low, high, sensitivity in (("kick", 30, 180, kick_sensitivity),
+                        ("snare", 180, 5000, snare_sensitivity), ("hihat", 6000, 16000, hihat_sensitivity)):
+                    band = spectrum[(frequencies >= low) & (frequencies < high)]
+                    flux = np.zeros(spectrum.shape[1], dtype=np.float32)
+                    if band.size:
+                        flux[1:] = np.maximum(np.diff(band, axis=1), 0).mean(axis=0)
+                    times = librosa.onset.onset_detect(onset_envelope=flux, sr=sample_rate,
+                        hop_length=512, units="time", delta=0.05 + (1 - sensitivity) * 0.2,
+                        wait=max(1, round(0.09 * sample_rate / 512)))
+                    data[f"{name}_times"] = times.tolist()
+                    data[f"total_{'hihats' if name == 'hihat' else name + 's'}"] = len(times)
+                print(f"[FL Audio Drum Detector] Band onsets: {data['total_kicks']} low, {data['total_snares']} mid, {data['total_hihats']} high")
+                return (json.dumps(data, indent=2),)
 
             # Detect onsets
             print(f"[FL Audio Drum Detector] Detecting onsets...")

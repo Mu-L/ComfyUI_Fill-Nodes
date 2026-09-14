@@ -4,6 +4,9 @@ logger = logging.getLogger("fl_fill_nodes")
 
 from . import routes
 
+from .nodes.conditioning.FL_KreaReference import FL_KreaReference, FL_KreaReferenceGuider
+from .nodes.ksamplers.FL_KsamplerSEG_Krea import FL_KsamplerSEG_Krea
+
 # AI NODES
 from .nodes.ai.FL_Fal_Gemini_ImageEdit import FL_Fal_Gemini_ImageEdit
 from .nodes.ai.FL_Fal_GPTImage2_Edit import FL_Fal_GPTImage2_Edit
@@ -43,6 +46,7 @@ from .nodes.api_tools.FL_API_ImageSaver import FL_API_ImageSaver
 # AUDIO NODES
 from .nodes.audio.FL_Audio_BPM_Analyzer import FL_Audio_BPM_Analyzer
 from .nodes.audio.FL_Audio_Beat_Prompt_Schedule import FL_Audio_Beat_Prompt_Schedule
+from .nodes.audio.FL_Prompt_Reference_Library import FL_Prompt_Reference_Library
 from .nodes.audio.FL_Audio_Prompt_Envelope import FL_Audio_Beat_Prompt_Envelope, FL_Audio_Envelope_Prompt
 from .nodes.audio.FL_Audio_Beat_Visualizer import FL_Audio_Beat_Visualizer
 from .nodes.audio.FL_Audio_Crop import FL_Audio_Crop
@@ -157,7 +161,7 @@ from .nodes.ksamplers.FL_KsamplerSigma import FL_KsamplerSigma
 from .nodes.ksamplers.FL_KsamplerSEG_Regions import FL_KsamplerSEG_Regions
 from .nodes.ksamplers.FL_KsamplerSEG_Captioner import FL_KsamplerSEG_Captioner
 from .nodes.ksamplers.FL_KsamplerSEG_Encoder import FL_KsamplerSEG_Encoder
-from .nodes.ksamplers.FL_KsamplerSEG import FL_KsamplerSEG
+from .nodes.ksamplers.FL_KsamplerSEG import FL_KsamplerSEG, FL_KsamplerSEGAdvanced
 from .nodes.ksamplers.FL_KsamplerSettings import FL_KsamplerSettings
 from .nodes.ksamplers.FL_SamplerStrings import FL_SamplerStrings
 from .nodes.ksamplers.FL_SchedulerStrings import FL_SchedulerStrings
@@ -208,6 +212,7 @@ from .nodes.utility.FL_SD_Slices import FL_SDUltimate_Slices
 from .nodes.utility.FL_SeparateMasks import FL_SeparateMaskComponents
 from .nodes.utility.FL_ShowText import FL_ShowText
 from .nodes.utility.FL_StringToLoraName import FL_StringToLoraName
+from .nodes.utility.FL_ModelDifferenceLoraSave import FL_ModelDifferenceLoraSave
 from .nodes.utility.FL_Switch import FL_Switch
 from .nodes.utility.FL_Switch_Big import FL_Switch_Big
 from .nodes.utility.FL_SystemCheck import FL_SystemCheck
@@ -220,6 +225,15 @@ from .nodes.vfx.FL_Ascii import FL_Ascii
 from .nodes.vfx.FL_DepthBlur import FL_DepthBlur
 from .nodes.vfx.FL_Dither import FL_Dither
 from .nodes.vfx.FL_Glitch import FL_Glitch
+from .nodes.vfx.FL_StreetScan import FL_ScanVideoDetections, FL_StreetScanComposite
+from .nodes.vfx.FL_ScanAudioEdit import FL_ScanAudioEdit
+from .nodes.vfx.FL_VoxelNormalRelief import FL_VoxelNormalRelief
+from .nodes.vfx.FL_LayeredParallax import FL_ParallaxLayer, FL_LayeredParallax, FL_ParallaxDepthSources, FL_ParallaxStackFromBatch
+from .nodes.vfx.FL_PosterLayers import FL_PosterLayerPlanner, FL_PosterLayers, FL_PosterLayerAsset, FL_PosterLayerStack
+from .nodes.vfx.poster_layer_cache import PosterLayerCache
+from comfy_execution.cache_provider import register_cache_provider
+
+from .nodes.vfx.FL_InteractiveScanFX import FL_InteractiveScanFX, FL_ScanAnalysis, FL_ScanVideoSection, FL_ScanVideoShots, FL_ScanAnalysisCollect
 from .nodes.vfx.FL_HalfTone import FL_HalftonePattern
 from .nodes.vfx.FL_HexagonalPattern import FL_HexagonalPattern
 from .nodes.vfx.FL_ImageCollage import FL_ImageCollage
@@ -263,7 +277,12 @@ from .nodes.wip.FL_WanVideoContinuationBlender import FL_WanVideoContinuationBle
 from .nodes.wip.FL_ZImageControlNetPatch import FL_ZImageControlNetPatch
 from .nodes.wip.FL_LTXVMaskedICLoRAGuide import FL_LTXVMaskedICLoRAGuide
 
+register_cache_provider(PosterLayerCache())
+
 NODE_CLASS_MAPPINGS = {
+    "FL_KreaReference": FL_KreaReference,
+    "FL_KreaReferenceGuider": FL_KreaReferenceGuider,
+    "FL_KsamplerSEG_Krea": FL_KsamplerSEG_Krea,
     "FL_SaveWebM": FL_SaveWebM,
     "FL_TextOverlayNode": FL_TextOverlayNode,
     "FL_ImageBlank": FL_ImageBlank,
@@ -281,6 +300,23 @@ NODE_CLASS_MAPPINGS = {
     "FL_ImageAddNoise": FL_ImageAddNoise,
     "FL_WordFrequencyGraph": FL_WordFrequencyGraph,
     "FL_Glitch": FL_Glitch,
+    "FL_ScanVideoDetections": FL_ScanVideoDetections,
+    "FL_StreetScanComposite": FL_StreetScanComposite,
+    "FL_ScanAudioEdit": FL_ScanAudioEdit,
+    "FL_VoxelNormalRelief": FL_VoxelNormalRelief,
+    "FL_ParallaxLayer": FL_ParallaxLayer,
+    "FL_LayeredParallax": FL_LayeredParallax,
+    "FL_ParallaxDepthSources": FL_ParallaxDepthSources,
+    "FL_ParallaxStackFromBatch": FL_ParallaxStackFromBatch,
+    "FL_PosterLayerPlanner": FL_PosterLayerPlanner,
+    "FL_PosterLayers": FL_PosterLayers,
+    "FL_PosterLayerAsset": FL_PosterLayerAsset,
+    "FL_PosterLayerStack": FL_PosterLayerStack,
+    "FL_InteractiveScanFX": FL_InteractiveScanFX,
+    "FL_ScanAnalysis": FL_ScanAnalysis,
+    "FL_ScanVideoSection": FL_ScanVideoSection,
+    "FL_ScanVideoShots": FL_ScanVideoShots,
+    "FL_ScanAnalysisCollect": FL_ScanAnalysisCollect,
     "FL_Ripple": FL_Ripple,
     "FL_PixelSort": FL_PixelSort,
     "FL_HexagonalPattern": FL_HexagonalPattern,
@@ -332,6 +368,7 @@ NODE_CLASS_MAPPINGS = {
     "FL_KsamplerSEG_Captioner": FL_KsamplerSEG_Captioner,
     "FL_KsamplerSEG_Encoder": FL_KsamplerSEG_Encoder,
     "FL_KsamplerSEG": FL_KsamplerSEG,
+    "FL_KsamplerSEGAdvanced": FL_KsamplerSEGAdvanced,
     "FL_FractalKSampler": FL_FractalKSampler,
     "FL_UpscaleModel": FL_UpscaleModel,
     "FL_SaveCSV": FL_SaveCSV,
@@ -414,6 +451,7 @@ NODE_CLASS_MAPPINGS = {
     "FL_GPT_Text": FL_GPT_Text,
     "FL_GoogleCloudStorage": FL_GoogleCloudStorage,
     "FL_StringToLoraName": FL_StringToLoraName,
+    "FL_ModelDifferenceLoraSave": FL_ModelDifferenceLoraSave,
     "FL_Switch": FL_Switch,
     "FL_Switch_Big": FL_Switch_Big,
     "FL_PasteByMask": FL_PasteByMask,
@@ -446,6 +484,7 @@ NODE_CLASS_MAPPINGS = {
     "FL_SaveRGBAAnimatedWebP": FL_SaveRGBAAnimatedWebP,
     "FL_Audio_BPM_Analyzer": FL_Audio_BPM_Analyzer,
     "FL_Audio_Beat_Prompt_Schedule": FL_Audio_Beat_Prompt_Schedule,
+    "FL_Prompt_Reference_Library": FL_Prompt_Reference_Library,
     "FL_Audio_Beat_Prompt_Envelope": FL_Audio_Beat_Prompt_Envelope,
     "FL_Audio_Envelope_Prompt": FL_Audio_Envelope_Prompt,
     "FL_Audio_Beat_Visualizer": FL_Audio_Beat_Visualizer,
@@ -490,6 +529,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FL_ImageAddNoise": "FL Image Add Noise",
     "FL_WordFrequencyGraph": "FL Word Frequency Graph",
     "FL_Glitch": "FL Glitch",
+    "FL_ScanVideoDetections": "FL Scan Video Detections",
+    "FL_StreetScanComposite": "FL Street Scan Composite",
+    "FL_ScanAudioEdit": "FL Scan Audio Edit",
+    "FL_VoxelNormalRelief": "FL Voxel Normal Relief",
+    "FL_ParallaxLayer": "FL Parallax Layer",
+    "FL_LayeredParallax": "FL Layered Parallax",
+    "FL_InteractiveScanFX": "FL Interactive Scan FX",
+    "FL_ScanAnalysis": "FL Scan Analysis",
+    "FL_ScanVideoSection": "FL Scan Video Section",
     "FL_Ripple": "FL Ripple",
     "FL_PixelSort": "FL PixelSort",
     "FL_HexagonalPattern": "FL Hexagonal Pattern",
@@ -542,6 +590,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FL_KsamplerSEG_Captioner": "FL KSampler SEG Captioner",
     "FL_KsamplerSEG_Encoder": "FL KSampler SEG Encoder",
     "FL_KsamplerSEG": "FL KSampler SEG",
+    "FL_KsamplerSEGAdvanced": "FL KSampler SEG Advanced",
+    "FL_KsamplerSEG_Krea": "FL KSampler SEG Krea",
     "FL_FractalKSampler": "FL Fractal KSampler",
     "FL_UpscaleModel": "FL Upscale Model",
     "FL_SaveCSV": "FL Save CSV",
@@ -624,6 +674,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FL_GPT_Text": "FL GPT Text",
     "FL_GoogleCloudStorage": "FL Google Cloud Storage Uploader",
     "FL_StringToLoraName": "FL String To Lora Name",
+    "FL_ModelDifferenceLoraSave": "FL Model Difference to LoRA",
     "FL_Switch": "FL Switch",
     "FL_Switch_Big": "FL Switch Big",
     "FL_PasteByMask": "FL Paste By Mask",
@@ -658,6 +709,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FL_SaveRGBAAnimatedWebP": "FL Save RGBA Animated WebP",
     "FL_Audio_BPM_Analyzer": "FL Audio BPM Analyzer",
     "FL_Audio_Beat_Prompt_Schedule": "FL Audio Beat Prompt Schedule",
+    "FL_Prompt_Reference_Library": "FL Prompt Reference Library",
     "FL_Audio_Beat_Prompt_Envelope": "FL Audio Beat Prompt Envelope",
     "FL_Audio_Envelope_Prompt": "FL Audio Envelope Prompt",
     "FL_Audio_Beat_Visualizer": "FL Audio Beat Visualizer",

@@ -5,6 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
+from .prompt_storyboard_actions import STORYBOARD_SCHEMA, REFERENCE_ASSIGNMENT_SCHEMA, normalize_storyboard_actions, normalize_reference_assignments, normalize_asset_ids
 
 
 MAX_BOXES = 256
@@ -50,12 +51,24 @@ GUIDE_INSTRUCTIONS = {
 
 def prompt_writing_instructions(guide_mode):
     return (
+        "When asked to generate storyboard references, request chronological contact sheets using the storyboard schema; "
+        "the host queues paid Nano Banana 2 images automatically after your response and attaches the panels to each section. Do not claim images already exist. "
+        "Prefer 2x2 for up to six seconds and 3x3 for longer sections. "
+        +
         GUIDE_INSTRUCTIONS[guide_mode]
         + "\n\nComplete packaged prompt-writing guide:\n\n"
         + PROMPT_WRITING_GUIDE
     )
 
 TOOLS = [
+    {"type": "function", "function": {
+        "name": "set_reference_assignments", "description": "Assign scoped section references using available library IDs.",
+        "parameters": {"type": "object", "properties": {"reference_assignments": REFERENCE_ASSIGNMENT_SCHEMA}, "required": ["reference_assignments"], "additionalProperties": False},
+    }},
+    {"type": "function", "function": {
+        "name": "generate_storyboards", "description": "Request section storyboard images. The host queues generation using ComfyUI credits after this turn, without another approval dialog.",
+        "parameters": {"type": "object", "properties": {"storyboards": STORYBOARD_SCHEMA}, "required": ["storyboards"], "additionalProperties": False},
+    }},
     {
         "type": "function",
         "function": {
@@ -618,6 +631,7 @@ def _normalize_request(value):
         "guide_mode": guide_mode,
         "messages": _normalize_messages(value.get("messages")),
         "boxes": _normalize_boxes(value.get("boxes")),
+        "reference_assets": normalize_asset_ids(value.get("reference_assets", [])),
     }
 
 
@@ -998,6 +1012,8 @@ async def run_prompt_writer(
         timeout = aiohttp.ClientTimeout(total=180, connect=10)
         session = aiohttp.ClientSession(timeout=timeout)
     tool_calls_used = 0
+    storyboards = []
+    reference_assignments = []
     final_text = ""
     target_indices = None
     streamed_indices = set()
@@ -1053,6 +1069,8 @@ async def run_prompt_writer(
                         "label": (
                             "Reading prompt boxes"
                             if name == "get_prompt_boxes"
+                            else "Preparing references"
+                            if name in {"generate_storyboards", "set_reference_assignments"}
                             else "Planning prompt edits"
                             if name == "plan_prompt_boxes"
                             else "Updating prompt boxes"
@@ -1075,6 +1093,12 @@ async def run_prompt_writer(
                     result = {"planned": target_indices, "count": len(target_indices)}
                     if on_prompt_progress:
                         await on_prompt_progress({"type": "plan", "target_indices": target_indices})
+                elif name == "generate_storyboards":
+                    storyboards = normalize_storyboard_actions(storyboards + arguments.get("storyboards", []), boxes_by_index)
+                    result = {"count": len(storyboards), "status": "ready for automatic generation after this turn"}
+                elif name == "set_reference_assignments":
+                    reference_assignments = normalize_reference_assignments(reference_assignments + arguments.get("reference_assignments", []), boxes_by_index, request["reference_assets"])
+                    result = {"count": len(reference_assignments), "status": "ready for automatic assignment after this turn"}
                 elif name == "set_prompt_boxes":
                     normalized_updates = _normalize_tool_updates(arguments, boxes_by_index)
                     if target_indices is None:
@@ -1104,6 +1128,8 @@ async def run_prompt_writer(
                         "label": (
                             f"Read {count} prompt box{'es' if count != 1 else ''}"
                             if name == "get_prompt_boxes"
+                            else f"Prepared {count} reference action(s)"
+                            if name in {"generate_storyboards", "set_reference_assignments"}
                             else f"Planned {count} prompt edit{'s' if count != 1 else ''}"
                             if name == "plan_prompt_boxes"
                             else f"Updated {count} prompt box{'es' if count != 1 else ''}"
@@ -1145,4 +1171,6 @@ async def run_prompt_writer(
         "updates": updates,
         "target_indices": target_indices or [],
         "tool_calls": tool_calls_used,
+        "storyboards": storyboards,
+        "reference_assignments": reference_assignments,
     }

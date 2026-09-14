@@ -2,13 +2,17 @@ import importlib.util
 import pathlib
 import sys
 import unittest
+import types
 from types import SimpleNamespace
 
 from aiohttp import web
 
 
 MODULE_PATH = pathlib.Path(__file__).parents[1] / "nodes" / "audio" / "prompt_writer_agent.py"
-SPEC = importlib.util.spec_from_file_location("fl_prompt_writer_agent_tests", MODULE_PATH)
+PACKAGE = types.ModuleType("fl_writer_agent_test_package")
+PACKAGE.__path__ = [str(MODULE_PATH.parent)]
+sys.modules[PACKAGE.__name__] = PACKAGE
+SPEC = importlib.util.spec_from_file_location("fl_writer_agent_test_package.prompt_writer_agent", MODULE_PATH)
 writer = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = writer
 SPEC.loader.exec_module(writer)
@@ -262,6 +266,8 @@ class PromptWriterAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("## 7. Complete Example", system_prompt)
         self.assertGreater(len(system_prompt), 23_000)
         self.assertEqual([tool["function"]["name"] for tool in self.calls[0]["tools"]], [
+            "set_reference_assignments",
+            "generate_storyboards",
             "get_prompt_boxes",
             "plan_prompt_boxes",
             "set_prompt_boxes",

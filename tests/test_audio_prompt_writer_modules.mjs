@@ -4,6 +4,105 @@ import test from "node:test";
 
 const AUDIO_NODE_URL = new URL("../web/nodes/audio/", import.meta.url);
 
+test("generated storyboards take precedence over simultaneous reference assignments", async () => {
+  const source = await readFile(new URL("audio_prompt_writer.js", AUDIO_NODE_URL), "utf8");
+  const module = await import(`data:text/javascript;base64,${Buffer.from(source.slice(source.indexOf("const NODE_DEFAULTS"))).toString("base64")}`);
+  const writer = Object.create(module.BeatPromptWriter.prototype);
+  const calls = [];
+  Object.assign(writer, {
+    runProgress: {}, writerActivity: {phase:"complete"}, statusElement:{dataset:{state:"applied"}},
+    generateStoryboards(actions) { calls.push(["generate", actions]); },
+    applyReferenceAssignments(actions) { calls.push(["assign", actions]); },
+    finishAssistantMessage() {}, scrollToBottom() {},
+  });
+  const storyboards = [{index:0, prompt:"Story"}];
+  writer.handleRunEvent({type:"run_finished", assistantMessage:{id:"message", metadata:{storyboards,
+    reference_assignments:[{index:0,mode:"none",asset_ids:[]},{index:1,mode:"custom",asset_ids:["existing"]}]}}});
+  assert.deepEqual(calls, [["generate", storyboards], ["assign", [{index:1,mode:"custom",asset_ids:["existing"]}]]]);
+});
+
+async function modelPicker(t) {
+  const source = await readFile(new URL("audio_prompt_writer.js", AUDIO_NODE_URL), "utf8");
+  assert.match(source, /<select data-writer-setting="model-select"/);
+  assert.match(source, /this\.modelInput\.value = this\.modelSelect\.value/);
+  assert.match(source, /this\.discoverModels\(false\)/);
+  const module = await import(`data:text/javascript;base64,${Buffer.from(source.slice(source.indexOf("const NODE_DEFAULTS"))).toString("base64")}`);
+  const originalDocument = globalThis.document;
+  globalThis.document = { createElement: () => ({}) };
+  t.after(() => { globalThis.document = originalDocument; });
+  const select = () => ({ value: "", children: [], replaceChildren(...children) { this.children = children; } });
+  const writer = Object.create(module.BeatPromptWriter.prototype);
+  Object.assign(writer, {
+    settings: { provider: "codex_subscription", presets: { codex_subscription: { reasoning_efforts: ["low", "high", "ultra"] } } },
+    providerSelect: { value: "codex_subscription" }, modelInput: { value: "saved-model" },
+    modelSelect: select(), modelOptions: select(), modelStatus: {}, models: [], modelRequest: 0,
+    reasoningSelect: { ...select(), value: "ultra" }, reasoningComposer: select(), toast() {},
+  });
+  return writer;
+}
+
+test("subscription dropdown loads all models, retains selection, and constrains reasoning", async (t) => {
+  const writer = await modelPicker(t);
+  writer.client = { models: async (refresh) => {
+    assert.equal(refresh, false);
+    return { models: [{ id: "saved-model", label: "Saved", reasoningEfforts: ["low", "high"] }, { id: "another-model", label: "Another" }] };
+  } };
+  await writer.discoverModels(false);
+  assert.deepEqual(writer.modelSelect.children.map((item) => item.value), ["saved-model", "another-model"]);
+  assert.equal(writer.modelSelect.value, "saved-model");
+  assert.equal(writer.reasoningSelect.value, "default");
+  assert.match(writer.modelStatus.textContent, /2 models available/);
+});
+
+test("empty or failed model discovery does not clear the saved model", async (t) => {
+  const writer = await modelPicker(t);
+  writer.client = { models: async () => ({ models: [] }) };
+  await writer.discoverModels();
+  assert.equal(writer.modelSelect.value, "saved-model");
+  assert.match(writer.modelSelect.children[0].textContent, /not in loaded list/);
+  assert.match(writer.modelStatus.textContent, /No models returned/);
+  writer.client.models = async () => { throw new Error("Unavailable"); };
+  await writer.discoverModels();
+  assert.equal(writer.modelSelect.value, "saved-model");
+  assert.match(writer.modelStatus.textContent, /Could not load models: Unavailable/);
+});
+
+test("model discovery ignores stale responses and unsaved provider switches", async (t) => {
+  const writer = await modelPicker(t);
+  let resolveFirst;
+  writer.client = { models: () => new Promise((resolve) => { resolveFirst = resolve; }) };
+  const pending = writer.discoverModels();
+  writer.client.models = async () => ({ models: [{ id: "new-model" }] });
+  await writer.discoverModels();
+  resolveFirst({ models: [{ id: "old-model" }] });
+  await pending;
+  assert.equal(writer.models[0].id, "new-model");
+  writer.providerSelect.value = "claude_subscription";
+  writer.client.models = () => { throw new Error("Must not query the saved Codex provider"); };
+  await writer.discoverModels();
+  assert.match(writer.modelStatus.textContent, /Save the provider connection/);
+});
+
+test("saving the dropdown choice forwards its model id", async (t) => {
+  const writer = await modelPicker(t);
+  writer.modelSelect.value = "another-model";
+  writer.modelInput.value = writer.modelSelect.value;
+  writer.credentialInput = { value: "" };
+  writer.baseUrlInput = { value: "" };
+  writer.temperatureInput = { value: "0.4" };
+  writer.maxTokensInput = { value: "16384" };
+  let saved;
+  writer.client = {
+    updateSettings: async (settings) => { saved = settings; return settings; },
+    status: async () => ({ configured: true }),
+  };
+  writer.populateSettings = writer.updateProviderBadge = writer.setStatus = () => {};
+  writer.discoverModels = async () => {};
+  await writer.saveSettings();
+  assert.equal(saved.model, "another-model");
+  assert.equal(saved.provider, "codex_subscription");
+});
+
 async function loadClientModule(fetchApi) {
   const source = await readFile(new URL("audio_prompt_writer_client.js", AUDIO_NODE_URL), "utf8");
   const start = source.indexOf("const ROOT");
@@ -21,6 +120,8 @@ test("standalone writer panel remains a valid ESM module", async () => {
   const encoded = Buffer.from(source.slice(start)).toString("base64");
   const module = await import(`data:text/javascript;base64,${encoded}`);
   assert.equal(typeof module.BeatPromptWriter, "function");
+  assert.doesNotMatch(source, /STARTERS|welcomeElement|flbps-writer-welcome|flbps-writer-starters|action === "starter"/);
+  assert.match(source, /data-writer-role="thread"/);
   assert.doesNotMatch(source, /FL_MCP|\/api\/chat|MCPServer/);
   assert.match(source, /client\.startRun/);
   assert.match(source, /event\.revision !== this\.currentDocument\.revision/);

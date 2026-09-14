@@ -105,13 +105,14 @@ class SegRegionsPreview {
       <div class="flks-seg-canvas-wrap" data-role="canvas-wrap">
         <div class="flks-seg-empty">Run the node to preview the tessellation here.</div>
       </div>
-      <div class="flks-seg-footer">cyan = cell boundary · yellow = region index</div>
+      <div class="flks-seg-footer" data-role="legend">cyan = cell boundary · yellow = region index</div>
     `;
     this.countEl = this.element.querySelector('[data-role="count"]');
     this.canvasWrap = this.element.querySelector('[data-role="canvas-wrap"]');
+    this.legend = this.element.querySelector('[data-role="legend"]');
   }
 
-  setPreview(imageDataUri, count, sizeWH) {
+  setPreview(imageDataUri, count, sizeWH, mode = "overlay", margins = null) {
     this.canvasWrap.innerHTML = "";
     if (!imageDataUri) return;
     const img = document.createElement("img");
@@ -122,6 +123,12 @@ class SegRegionsPreview {
     }
     this.canvasWrap.appendChild(img);
     if (this.countEl) this.countEl.textContent = `${count} regions`;
+    this.legend.textContent = mode === "coverage_heatmap"
+      ? "red = low coverage · blue = single region · cyan = overlap"
+      : mode === "sampler_crops"
+        ? "bright = edit mask · dim = surrounding context · labels = crop size"
+        : "cyan = cell boundary · yellow = region index";
+    if (margins) this.legend.textContent += ` · band ${margins.overlap}px / feather ${margins.feather}px / context ${margins.context}px`;
   }
 
   dispose() {
@@ -132,12 +139,56 @@ class SegRegionsPreview {
 }
 
 const INSTANCES = new Map();
+const nodeKey = (value) => String(value);
+const hiddenWidgets = new WeakMap();
+
+function setMarginWidgetVisible(widget, visible) {
+  if (!widget) return;
+  if (!visible && !hiddenWidgets.has(widget)) {
+    hiddenWidgets.set(widget, { type: widget.type, computeSize: widget.computeSize, hidden: widget.hidden });
+    widget.type = "converted-widget";
+    widget.computeSize = () => [0, -4];
+    widget.hidden = true;
+  } else if (visible && hiddenWidgets.has(widget)) {
+    Object.assign(widget, hiddenWidgets.get(widget));
+    hiddenWidgets.delete(widget);
+  }
+}
 
 app.registerExtension({
   name: "ComfyUI.FL_KsamplerSEG_Regions",
   nodeCreated(node) {
     const comfyClass = (node.constructor && node.constructor.comfyClass) || "";
     if (comfyClass !== "FL_KsamplerSEG_Regions") return;
+
+    const mode = node.widgets.find(w => w.name === "margin_mode");
+    const overlap = node.widgets.find(w => w.name === "overlap_width_px");
+    const feather = node.widgets.find(w => w.name === "feather_width_px");
+    const updateMargins = () => {
+      const pixels = mode.value === "pixels";
+      if (pixels) {
+        feather.options.max = overlap.value / 2;
+        feather.value = Math.min(feather.value, feather.options.max);
+      }
+      for (const name of ["region_overlap_factor", "edge_softness", "context_padding_factor"])
+        setMarginWidgetVisible(node.widgets.find(w => w.name === name), !pixels);
+      for (const name of ["overlap_width_px", "feather_width_px", "context_padding_px"])
+        setMarginWidgetVisible(node.widgets.find(w => w.name === name), pixels);
+      node.setDirtyCanvas(true, true);
+    };
+    const modeCallback = mode.callback;
+    mode.callback = function (...args) { modeCallback?.apply(this, args); updateMargins(); };
+    const overlapCallback = overlap.callback;
+    overlap.callback = function (...args) { overlapCallback?.apply(this, args); updateMargins(); };
+    const onConfigure = node.onConfigure;
+    node.onConfigure = function (data) {
+      const result = onConfigure?.apply(this, arguments);
+      const saved = data.widgets_values?.[node.widgets.indexOf(mode)];
+      if (saved !== "pixels" && saved !== "legacy") mode.value = "legacy";
+      updateMargins();
+      return result;
+    };
+    updateMargins();
 
     const container = document.createElement("div");
     container.id = `flks-seg-regions-container-${node.id}`;
@@ -161,14 +212,15 @@ app.registerExtension({
 
     setTimeout(() => {
       const inst = new SegRegionsPreview({ node, container });
-      INSTANCES.set(node.id, inst);
+      INSTANCES.set(nodeKey(node.id), inst);
     }, 50);
 
     widget.onRemove = () => {
-      const inst = INSTANCES.get(node.id);
+      const key = nodeKey(node.id);
+      const inst = INSTANCES.get(key);
       if (inst) {
         inst.dispose();
-        INSTANCES.delete(node.id);
+        INSTANCES.delete(key);
       }
     };
   },
@@ -177,8 +229,7 @@ app.registerExtension({
 api.addEventListener("fl_seg_regions_preview", (event) => {
   const detail = event.detail;
   if (!detail) return;
-  const nodeId = parseInt(detail.node, 10);
-  const inst = INSTANCES.get(nodeId);
+  const inst = INSTANCES.get(nodeKey(detail.node));
   if (!inst) return;
-  inst.setPreview(detail.image, detail.count, detail.size);
+  inst.setPreview(detail.image, detail.count, detail.size, detail.mode, detail.margins);
 });

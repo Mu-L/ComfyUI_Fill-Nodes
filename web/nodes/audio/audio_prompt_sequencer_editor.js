@@ -1,4 +1,5 @@
 import { api } from "../../../../scripts/api.js";
+import { loadReferences, serializeReferences, mountReferences } from "./audio_prompt_references.js";
 import {
   cropTimes,
   cropTimesWithValues,
@@ -509,6 +510,7 @@ export class BeatPromptSequencer {
     this.songLabelEditor = this.root.querySelector('[data-role="song-label-editor"]');
     this.inspector = this.root.querySelector('[data-role="inspector"]');
     this.clipInspector = this.root.querySelector('[data-role="clip-inspector"]');
+    mountReferences(this);
     this.songInspector = this.root.querySelector('[data-role="song-inspector"]');
     this.lyricsInspector = this.root.querySelector('[data-role="lyrics-inspector"]');
     this.activeLaneEl = this.root.querySelector('[data-role="active-lane"]');
@@ -822,6 +824,7 @@ export class BeatPromptSequencer {
     for (const name of HISTORY_WIDGETS) widgetValues[name] = cloneHistoryValue(this.widgets?.[name]?.value);
     return {
       clips: cloneHistoryValue(this.clips || []),
+      referenceAssets: cloneHistoryValue(this.referenceAssets || {}),
       songMapOverrides: cloneHistoryValue(this.songMapOverrides),
       lyricsTimeline: cloneHistoryValue(lyricsTimelineForStorage(this.lyricsTimeline)),
       envelopeSlots: cloneHistoryValue(this.envelopeSlots || [null, null, null]),
@@ -835,6 +838,7 @@ export class BeatPromptSequencer {
     if (!state) return "";
     return JSON.stringify({
       clips: state.clips,
+      referenceAssets: state.referenceAssets,
       songMapOverrides: state.songMapOverrides,
       lyricsTimeline: state.lyricsTimeline,
       envelopeSlots: state.envelopeSlots,
@@ -983,6 +987,8 @@ export class BeatPromptSequencer {
         if (this.widgets[name]) this.widgets[name].value = cloneHistoryValue(value);
       }
       this.clips = normalizeCrossfades(cloneHistoryValue(state.clips || []));
+      this.referenceAssets = cloneHistoryValue(state.referenceAssets || {});
+      serializeReferences(this);
       this.songMapOverrides = normalizeSongMapOverrides(cloneHistoryValue(state.songMapOverrides));
       this.lyricsTimeline = normalizeLyricsTimeline(cloneHistoryValue(state.lyricsTimeline));
       this.envelopeSlots = cloneHistoryValue(state.envelopeSlots || [null, null, null]);
@@ -2490,6 +2496,7 @@ export class BeatPromptSequencer {
   }
 
   restoreRenderGroups() {
+    loadReferences(this);
     try {
       normalizeRenderGroups(loadRenderGroups(
         this.clips,
@@ -2565,6 +2572,8 @@ export class BeatPromptSequencer {
       crossfade: Math.round(finiteNumber(section.crossfade_frames)),
       prompt: String(section.prompt || ""),
       renderGroup: section.render_group ?? null,
+      sectionId: section.section_id,
+      references: section.references,
     }));
   }
 
@@ -3000,6 +3009,7 @@ export class BeatPromptSequencer {
   }
 
   syncInspector() {
+    this.syncReferences?.();
     this.syncSongInspector();
     this.syncLyricsInspector();
     const clip = this.selectedClip();
@@ -3841,6 +3851,14 @@ export class BeatPromptSequencer {
         Math.round(this.defaultFadeIn()),
         Math.round(this.defaultFadeOut()),
       ));
+      const previousRanges = new Map(this.clips.map(clip => [`${clip.start}:${clip.end}`, clip]));
+      for (const clip of clips) {
+        const previous = previousRanges.get(`${clip.start}:${clip.end}`);
+        if (previous) {
+          clip.sectionId = previous.sectionId;
+          clip.references = structuredClone(previous.references);
+        }
+      }
       this.widgets.timeUnit.value = "frames";
       this.clips = clips;
       this.select(clips.length ? 0 : -1);
@@ -3866,6 +3884,7 @@ export class BeatPromptSequencer {
     if (this.rawInvalid || this.migrationPending || !this.widgets.timeline) return;
     normalizeRenderGroups(this.clips);
     this.widgets.timeline.value = serializeTimeline(this.clips);
+    serializeReferences(this);
     if (this.widgets.renderGroups) {
       this.widgets.renderGroups.value = serializeRenderGroups(this.clips);
     }
@@ -4416,6 +4435,10 @@ export class BeatPromptSequencer {
   groupSelectionError() {
     const indices = this.selectedClipIndices();
     if (indices.length < 2) return "Select at least two prompt blocks.";
+    const references = JSON.stringify(this.clips[indices[0]].references || { mode: "defaults", asset_ids: [] });
+    if (indices.some(index => JSON.stringify(this.clips[index].references || { mode: "defaults", asset_ids: [] }) !== references)) {
+      return "Grouped renders must share the same ordered references. Match their selections first.";
+    }
     for (let position = 1; position < indices.length; position++) {
       const previousIndex = indices[position - 1];
       const index = indices[position];
@@ -4705,6 +4728,7 @@ export class BeatPromptSequencer {
     const fadeOut = Math.min(clip.fadeOut, duplicateDuration - fadeIn);
     this.clips.splice(this.selectedIndex + 1, 0, {
       ...clip,
+      sectionId: crypto.randomUUID(),
       start,
       end,
       fadeIn,
@@ -4786,6 +4810,7 @@ export class BeatPromptSequencer {
     const fadeOut = Math.min(source.fadeOut, duration - fadeIn);
     this.clips.splice(insertionIndex, 0, {
       ...source,
+      sectionId: crypto.randomUUID(),
       start,
       end,
       fadeIn,
@@ -4817,6 +4842,7 @@ export class BeatPromptSequencer {
     };
     const second = {
       ...clip,
+      sectionId: crypto.randomUUID(),
       start: split,
       fadeIn: 0,
       fadeOut: Math.min(clip.fadeOut, clip.end - split),
@@ -5808,6 +5834,7 @@ export class BeatPromptSequencer {
       const syncEnvelopePreviews = this.staticDirty;
       this.draw();
       if (syncEnvelopePreviews) this.syncEnvelopePreviews();
+      else this.updateEnvelopePlayheads();
     });
   }
 
@@ -6927,6 +6954,7 @@ export class BeatPromptSequencer {
     ctx.drawImage(this.staticCanvas, 0, 0);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this.drawWriterActivity(ctx);
+    this.renderStoryboardThumbnails?.();
     this.drawGuidesAndPlayhead(ctx, cssWidth, layout);
     this.positionSongLabelEditor();
   }

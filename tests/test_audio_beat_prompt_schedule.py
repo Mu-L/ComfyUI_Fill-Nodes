@@ -35,6 +35,36 @@ def beat_json():
 
 
 class BeatPromptScheduleTests(unittest.TestCase):
+    def test_reference_fingerprint_uses_serialized_widget_without_linked_inputs(self):
+        with mock.patch.object(schedule, "reference_file_fingerprint", return_value=(("image.png", 1, 2),)) as fingerprint:
+            value = schedule.FL_Audio_Beat_Prompt_Schedule.fingerprint_inputs(reference_schedule="manifest")
+        fingerprint.assert_called_once_with("manifest")
+        self.assertEqual(value, (None, (("image.png", 1, 2),)))
+
+    def test_frame_schedule_without_detected_beats(self):
+        payload = json.loads(beat_json())
+        payload['beat_times'] = []
+        output = schedule.FL_Audio_Beat_Prompt_Schedule.execute(
+            beat_positions=json.dumps(payload), timeline='[0 - 60]\nAnime action.',
+            time_unit='frames', fps=24, sequence_duration=60).result
+        self.assertEqual(output[1], 60)
+        self.assertEqual(output[0]['sections'][0]['end'], 2.5)
+        with self.assertRaisesRegex(ValueError, 'non-empty'):
+            schedule.FL_Audio_Beat_Prompt_Schedule.execute(
+                beat_positions=json.dumps(payload), timeline='[0 - 4]\nAnime action.', time_unit='beats')
+
+    def test_reference_metadata_survives_schedule_and_frame_payload(self):
+        metadata = {"version": 1, "assets": {}, "sections": [{"id": "section-a", "mode": "none", "asset_ids": []}]}
+        output = schedule.FL_Audio_Beat_Prompt_Schedule.execute(
+            beat_positions=beat_json(), timeline="[0 - 60]\nA runner.", default_fade_in=0,
+            default_fade_out=0, curve="linear", reference_schedule=json.dumps(metadata),
+        ).result[0]
+        self.assertEqual(output["sections"][0]["section_id"], "section-a")
+        self.assertEqual(output["sections"][0]["references"], {"mode": "none", "asset_ids": []})
+        frames = schedule._frame_sections(output["sections"], 24, 60)
+        self.assertEqual(frames[0]["section_id"], "section-a")
+        self.assertEqual(output["reference_assets"], {})
+
     def test_fractional_beats_use_exact_detected_intervals(self):
         beats, duration = schedule._load_beats(beat_json())
         sections = schedule._resolve_schedule(
@@ -471,6 +501,7 @@ class BeatPromptScheduleTests(unittest.TestCase):
                 "render_groups",
                 "analysis_cache_key",
                 "envelope_layers",
+                "reference_schedule",
             ],
         )
         self.assertEqual(

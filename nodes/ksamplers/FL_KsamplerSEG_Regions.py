@@ -1,21 +1,3 @@
-# FL_KsamplerSEG_Regions: tessellate an image into N Voronoi cells with
-# overlapping, feathered region masks so EVERY pixel is touched by at least
-# one diffusion pass and seams blend smoothly. Optional Lloyd relaxation for
-# uniform cell sizes; optional safe-zone subtraction.
-#
-# Mask design (post-fix):
-#   - One soft mask per region. Built by dilating the hard Voronoi cell, then
-#     gaussian-blurring the edge. The result has values in [0, 1] that taper
-#     across the boundary into adjacent cells.
-#   - The SAME soft mask is used as both the diffusion noise_mask AND the
-#     composite blend mask. This guarantees: (a) the model partially updates
-#     pixels in the overlap band, (b) the alpha-accumulator math is consistent
-#     and normalizes to ~1.0 everywhere, (c) the union of all masks covers the
-#     entire canvas (modulo safe_zone).
-#
-# Performance: Voronoi labeling, mask processing, and Lloyd relaxation all run
-# on the user's torch device (GPU when available) using batched ops.
-
 import io
 import base64
 import math
@@ -24,6 +6,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from scipy.ndimage import distance_transform_edt
 
 from server import PromptServer
 
@@ -44,12 +27,16 @@ class FL_KsamplerSEG_Regions:
                 "downscale_ratio": ("INT", {"default": 8, "min": 1, "max": 16, "step": 1}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0x7fffffff}),
                 "show_preview": ("BOOLEAN", {"default": True}),
-                "preview_mode": (["overlay", "coverage_heatmap"], {"default": "overlay"}),
+                "preview_mode": (["overlay", "coverage_heatmap", "sampler_crops"], {"default": "overlay"}),
             },
             "optional": {
                 "image": ("IMAGE",),
                 "latent": ("LATENT",),
                 "safe_zone_mask": ("MASK",),
+                "margin_mode": (["pixels", "legacy"], {"default": "pixels", "tooltip": "Bounded margins in output-image pixels, quantized to the downscale grid. Legacy preserves factor-based workflows."}),
+                "overlap_width_px": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 8, "tooltip": "Total shared band across a cell boundary. Each neighboring mask extends by half this distance. Zero means no expansion."}),
+                "feather_width_px": ("INT", {"default": 32, "min": 0, "max": 2048, "step": 8, "tooltip": "Fade inside the expanded edge; never enlarges the region. Cannot exceed half the overlap width."}),
+                "context_padding_px": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 8, "tooltip": "Extra image context per crop edge, outside the edit mask. Does not expand the edit mask."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -62,7 +49,12 @@ class FL_KsamplerSEG_Regions:
     def build(self, num_regions, relaxation_iterations, region_overlap_factor,
               edge_softness, context_padding_factor, safe_zone_feather_px,
               downscale_ratio, seed, show_preview, preview_mode,
-              image=None, latent=None, safe_zone_mask=None, unique_id=None):
+              image=None, latent=None, safe_zone_mask=None, unique_id=None,
+              margin_mode="legacy", overlap_width_px=64, feather_width_px=32, context_padding_px=64):
+        if margin_mode not in ("pixels", "legacy"):
+            raise ValueError("Choose pixels or legacy for margin_mode.")
+        if margin_mode == "pixels" and not (0 <= feather_width_px <= overlap_width_px / 2 and context_padding_px >= 0):
+            raise ValueError("Feather width must be between zero and half the overlap width; context padding must be non-negative.")
         if image is None and latent is None:
             raise ValueError(
                 "FL_KsamplerSEG_Regions: connect either 'image' or 'latent' to size the regions."
@@ -83,12 +75,8 @@ class FL_KsamplerSEG_Regions:
 
         device = self._pick_device()
 
-        # All heavy mask work runs at "work resolution" -- 2x latent res. The
-        # sampler downsamples masks 8x to latent space anyway, so doing them
-        # at 8x* of full means we redundantly compute ~64x more pixels than
-        # needed. work_scale = downscale_ratio * 2 keeps a 2x margin for
-        # crisp boundaries.
-        work_scale = max(1, int(downscale_ratio) * 2)
+        # Pixel margins use the latent grid; legacy keeps its original coarser grid.
+        work_scale = max(1, int(downscale_ratio) * (2 if margin_mode == "legacy" else 1))
         H_w = max(8, (H + work_scale - 1) // work_scale)
         W_w = max(8, (W + work_scale - 1) // work_scale)
         sx = W_w / float(W)
@@ -120,25 +108,18 @@ class FL_KsamplerSEG_Regions:
             )
         hard_masks_w = hard_masks_w[non_empty]
 
-        # Per-cell typical size in WORK-res pixels.
-        cell_areas_w = hard_masks_w.flatten(1).sum(dim=1)
-        avg_cell_side_w = float(cell_areas_w.mean().sqrt().item())
-
-        # Dilation + feather radii in work-res pixels (proportionally smaller
-        # than the full-res equivalents -- this is where the speedup comes from).
-        dilate_w = max(1.0, float(region_overlap_factor) * avg_cell_side_w)
-        feather_w = max(1.0, float(edge_softness) * avg_cell_side_w)
-
-        # Build soft masks at work res. Both ops batched + grouped so N regions
-        # cost roughly the same as 1.
-        soft_masks_w = self._dilate_then_blur(hard_masks_w, dilate_w, feather_w)
-
-        # Per-region renormalize so each soft mask peaks at 1.0.
-        peaks = soft_masks_w.flatten(1).amax(dim=1).clamp(min=1e-6).view(-1, 1, 1)
-        soft_masks_w = (soft_masks_w / peaks).clamp(0.0, 1.0)
-
-        # Bbox extraction at WORK res, vectorized via row/col any (no Python loop).
-        bboxes_w = self._extract_bboxes_vectorized(soft_masks_w, alpha_threshold=0.01)
+        if margin_mode == "pixels":
+            soft_masks_w = self._pixel_masks(hard_masks_w, overlap_width_px / 2, feather_width_px, H / H_w, W / W_w)
+            bboxes_w = self._extract_bboxes_vectorized(hard_masks_w)
+        else:
+            cell_areas_w = hard_masks_w.flatten(1).sum(dim=1)
+            avg_cell_side_w = float(cell_areas_w.mean().sqrt().item())
+            dilate_w = max(1.0, float(region_overlap_factor) * avg_cell_side_w)
+            feather_w = max(1.0, float(edge_softness) * avg_cell_side_w)
+            soft_masks_w = self._dilate_then_blur(hard_masks_w, dilate_w, feather_w)
+            peaks = soft_masks_w.flatten(1).amax(dim=1).clamp(min=1e-6).view(-1, 1, 1)
+            soft_masks_w = (soft_masks_w / peaks).clamp(0.0, 1.0)
+            bboxes_w = self._extract_bboxes_vectorized(soft_masks_w, alpha_threshold=0.01)
 
         # Scale work-res bboxes back up to image-res. Round outward so we never
         # truncate the soft mask at the bbox edge.
@@ -154,7 +135,7 @@ class FL_KsamplerSEG_Regions:
         padded_bboxes = []
         for (y0, x0, y1, x1) in bboxes:
             max_side = max(y1 - y0, x1 - x0)
-            pad = int(round(float(context_padding_factor) * max_side))
+            pad = math.ceil(overlap_width_px / 2 + context_padding_px) if margin_mode == "pixels" else int(round(float(context_padding_factor) * max_side))
             padded_bboxes.append((
                 max(0, y0 - pad),
                 max(0, x0 - pad),
@@ -190,16 +171,15 @@ class FL_KsamplerSEG_Regions:
         if safe_zone_mask is None and min_cov < 0.01:
             print(
                 f"[FL_KsamplerSEG_Regions] warning: coverage minimum is {min_cov:.4f}; "
-                f"some pixels may not be diffused. Increase region_overlap_factor."
+                f"some pixels may not be diffused. Check region masks."
             )
 
-        # Single full-res upsample of all soft masks at the end. Bilinear is
-        # fine because the masks are already smooth (gaussian-blurred) at
-        # work res; upsampling adds no aliasing artifacts.
+        # Preserve the pixel-mode latent grid without adding another blur band.
         if (H_w, W_w) != (H, W):
             soft_masks = F.interpolate(
                 soft_masks_w.unsqueeze(0), size=(H, W),
-                mode="bilinear", align_corners=False,
+                mode="nearest" if margin_mode == "pixels" else "bilinear",
+                align_corners=None if margin_mode == "pixels" else False,
             ).squeeze(0).clamp(0.0, 1.0)
         else:
             soft_masks = soft_masks_w
@@ -223,7 +203,9 @@ class FL_KsamplerSEG_Regions:
         # Visualization. Upsample the work-res coverage / labels to full res
         # for display. (The visualization is the only place we touch full res
         # outside of the final mask upsample.)
-        if preview_mode == "coverage_heatmap":
+        if preview_mode == "sampler_crops":
+            viz = self._build_crop_viz(viz_source, shape_t, padded_bboxes)
+        elif preview_mode == "coverage_heatmap":
             coverage_full = F.interpolate(
                 coverage_w.unsqueeze(0).unsqueeze(0), size=(H, W),
                 mode="bilinear", align_corners=False,
@@ -252,6 +234,10 @@ class FL_KsamplerSEG_Regions:
                         "size": [W, H],
                         "min_coverage": round(min_cov, 4),
                         "max_coverage": round(max_cov, 4),
+                        "mode": preview_mode,
+                        "margins": None if margin_mode == "legacy" else {
+                            "overlap": overlap_width_px, "feather": feather_width_px, "context": context_padding_px,
+                        },
                     },
                 )
             except Exception as e:
@@ -574,3 +560,36 @@ class FL_KsamplerSEG_Regions:
         buf = io.BytesIO()
         pil.save(buf, format="PNG")
         return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    @staticmethod
+    def _build_crop_viz(image_np, masks, bboxes):
+        source = Image.fromarray(image_np)
+        sheet = Image.new("RGB", (640, 350 * math.ceil(len(bboxes) / 2)), "#18181b")
+        draw = ImageDraw.Draw(sheet)
+        for i, (y0, x0, y1, x1) in enumerate(bboxes):
+            crop = source.crop((x0, y0, x1, y1))
+            crop.thumbnail((304, 310), Image.Resampling.LANCZOS)
+            mask = Image.fromarray((masks[i, y0:y1, x0:x1].numpy() * 255).astype(np.uint8))
+            mask = mask.resize(crop.size, Image.Resampling.BILINEAR)
+            context = Image.blend(crop, Image.new("RGB", crop.size, "#06131a"), 0.7)
+            crop = Image.composite(crop, context, mask)
+            x, y = (i % 2) * 320, (i // 2) * 350
+            draw.text((x + 8, y + 8), f"Mask {i}: {x1-x0} x {y1-y0}", fill="white")
+            sheet.paste(crop, (x + (320 - crop.width) // 2, y + 32))
+        return np.array(sheet)
+
+    @staticmethod
+    def _pixel_masks(hard_masks, expansion_px, feather_px, pixel_h, pixel_w):
+        if expansion_px == 0:
+            return hard_masks
+        masks = []
+        for hard in hard_masks.detach().cpu().numpy().astype(bool):
+            distance = distance_transform_edt(~hard, sampling=(pixel_h, pixel_w))
+            distance = np.maximum(0, distance - min(pixel_h, pixel_w) / 2)
+            if feather_px == 0:
+                soft = (distance <= expansion_px).astype(np.float32)
+            else:
+                soft = np.clip((expansion_px - distance) / feather_px, 0, 1).astype(np.float32)
+            soft[hard] = 1
+            masks.append(torch.from_numpy(soft))
+        return torch.stack(masks).to(device=hard_masks.device)

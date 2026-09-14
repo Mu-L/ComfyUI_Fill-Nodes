@@ -14,16 +14,21 @@
 # The soft masks come from FL_KsamplerSEG_Regions; they overlap and feather
 # already, so coverage is guaranteed.
 
+import base64
+import io
 import logging
+import math
 
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 import comfy.sample
 import comfy.samplers
 import comfy.utils
 import comfy.model_management
 import latent_preview
+from server import PromptServer
 
 from .FL_KsamplerSEG_common import unwrap_regions, latent_bbox_from_image_bbox
 from ._latent_helpers import primary_only_noise_mask, primary_tensor, replace_primary_tensor
@@ -38,7 +43,7 @@ class FL_KsamplerSEG:
         return {
             "required": {
                 "model": ("MODEL",),
-                "regions": ("SEG_REGIONS",),
+                "regions": ("SEG_REGIONS", {"tooltip": "Encoded regions override positive and negative. Use raw Regions to preserve connected reference conditioning."}),
                 "latent_image": ("LATENT",),
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
@@ -50,6 +55,7 @@ class FL_KsamplerSEG:
                 "denoise": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "cascade_start_corner": (CASCADE_START_CORNERS, {"default": "top_left"}),
             },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("LATENT",)
@@ -63,8 +69,21 @@ class FL_KsamplerSEG:
 
     def sample(self, model, regions, latent_image, positive, negative,
                seed, steps, cfg, sampler_name, scheduler, denoise,
-               cascade_start_corner):
+               cascade_start_corner, unique_id=None):
+        return self._sample_regions(model, regions, latent_image, positive, negative,
+                                    seed, steps, cfg, sampler_name, scheduler, denoise,
+                                    cascade_start_corner, unique_id)
+
+    def _sample_regions(self, model, regions, latent_image, positive, negative,
+                        seed, steps, cfg, sampler_name, scheduler, denoise,
+                        cascade_start_corner, unique_id=None, *, disable_noise=False,
+                        start_step=None, last_step=None, force_full_denoise=False):
         regions = unwrap_regions(regions)
+        window_start = 0 if start_step is None else start_step
+        window_end = steps if last_step is None else min(steps, last_step)
+        region_steps = max(0, window_end - window_start)
+        if region_steps == 0:
+            return (latent_image,)
 
         latent_samples = latent_image["samples"]
         primary_samples = primary_tensor(latent_samples)
@@ -77,34 +96,15 @@ class FL_KsamplerSEG:
                 "An empty latent at low denoise produces noise."
             )
 
-        H, W = regions["image_size"]
-        latent_h = primary_samples.shape[-2]
-        latent_w = primary_samples.shape[-1]
-
-        # Auto-detect the actual spatial downscale from the model. Different
-        # models use different ratios -- SD/SDXL=8, Flux=8, LTX-Video=32,
-        # Hunyuan-Video=16, etc. Use the model's authoritative value rather
-        # than the user's hint on the Regions node, which won't know.
-        downscale = self._resolve_downscale(model, regions, latent_h, latent_w, H, W)
-
-        expected_lh = (H + downscale - 1) // downscale
-        expected_lw = (W + downscale - 1) // downscale
-        if abs(latent_h - expected_lh) > 1 or abs(latent_w - expected_lw) > 1:
-            logging.warning(
-                f"[FL_KsamplerSEG] latent shape ({latent_h}x{latent_w}) doesn't match "
-                f"regions image_size {H}x{W} / downscale={downscale}. Sampling may misalign."
-            )
-
-        # One-line diagnostic so users can confirm the right downscale was picked.
-        print(f"[FL_KsamplerSEG] latent={tuple(primary_samples.shape)}  "
-              f"regions={H}x{W}  downscale={downscale}")
-
         device = model.load_device
 
         latent_full = comfy.sample.fix_empty_latent_channels(
             model, latent_samples.to(device=device),
             latent_image.get("downscale_ratio_spacial", None),
         )
+        H, W = regions["image_size"]
+        latent_h, latent_w = primary_tensor(latent_full).shape[-2:]
+        downscale = self._resolve_downscale(model, regions, latent_h, latent_w, H, W)
 
         N = regions["shape_masks"].shape[0]
         per_region_cond = regions.get("conditioning_per_region")
@@ -150,7 +150,23 @@ class FL_KsamplerSEG:
         # it must broadcast as (1,1,1,H,W) -- one extra leading dim per
         # non-spatial axis. PyTorch won't auto-align mismatched-rank tensors.
         latent_ndim = canvas.ndim
-        for spec in region_specs:
+        total_steps = region_steps * len(region_specs)
+        preview_callback = latent_preview.prepare_callback(model, total_steps)
+        for region_step, spec in enumerate(region_specs):
+            preview_state = {
+                "node": str(unique_id), "region": spec["region_index"],
+                "position": region_step + 1, "count": len(region_specs),
+                "step": 0, "steps": region_steps, "state": "sampling",
+                "start_step": start_step, "end_step": window_end, "schedule_steps": steps,
+                "crop": list(spec["latent_bbox"]), "size": [latent_w, latent_h],
+                "mask": self._preview_mask(spec["write_lat"]),
+            }
+
+            def send_status():
+                if unique_id is not None and PromptServer.instance is not None:
+                    PromptServer.instance.send_sync("fl_seg_sampling", dict(preview_state), PromptServer.instance.client_id)
+
+            send_status()
             samples = self._sample_one_region_full(
                 model=model,
                 source_latent=replace_primary_tensor(latent_full, canvas),
@@ -158,6 +174,10 @@ class FL_KsamplerSEG:
                 steps=steps, cfg=cfg, sampler_name=sampler_name,
                 scheduler=scheduler, denoise=denoise,
                 latent_ndim=latent_ndim,
+                preview_callback=preview_callback, step_offset=region_step * region_steps,
+                total_steps=total_steps, preview_state=preview_state, send_status=send_status,
+                disable_noise=disable_noise, start_step=start_step, last_step=last_step,
+                force_full_denoise=force_full_denoise,
             )
             by0, bx0, by1, bx1 = spec["latent_bbox"]
             comp_b = self._reshape_mask_for_broadcast(
@@ -166,6 +186,9 @@ class FL_KsamplerSEG:
             samples_dev = samples.to(device=canvas.device, dtype=canvas.dtype)
             existing = canvas[..., by0:by1, bx0:bx1]
             canvas[..., by0:by1, bx0:bx1] = samples_dev * comp_b + existing * (1.0 - comp_b)
+
+        preview_state["state"] = "complete"
+        send_status()
 
         out = replace_primary_tensor(latent_full, canvas).to(
             device=comfy.model_management.intermediate_device(),
@@ -238,7 +261,10 @@ class FL_KsamplerSEG:
 
     def _sample_one_region_full(self, *, model, source_latent, spec,
                                 steps, cfg, sampler_name, scheduler, denoise,
-                                latent_ndim=None):
+                                latent_ndim=None, preview_callback=None, step_offset=0,
+                                total_steps=None, preview_state=None, send_status=None,
+                                disable_noise=False, start_step=None, last_step=None,
+                                force_full_denoise=False):
         """Run a complete sampler call (all steps) for one region, sourcing the
         crop from `source_latent` (the in-progress canvas)."""
         by0, bx0, by1, bx1 = spec["latent_bbox"]
@@ -246,7 +272,8 @@ class FL_KsamplerSEG:
         primary_crop = source_primary[..., by0:by1, bx0:bx1].contiguous()
         latent_crop = replace_primary_tensor(source_latent, primary_crop)
 
-        noise = comfy.sample.prepare_noise(latent_crop.cpu(), spec["seed"])
+        noise = (comfy.sample.prepare_empty_noise(latent_crop) if disable_noise
+                 else comfy.sample.prepare_noise(latent_crop.cpu(), spec["seed"]))
 
         # Mask must match the latent rank so it broadcasts. For 4D latent
         # (image): (1,1,H,W). For 5D latent (video): (1,1,1,H,W).
@@ -257,22 +284,59 @@ class FL_KsamplerSEG:
         ).to(dtype=primary_crop.dtype)
         noise_mask = primary_only_noise_mask(latent_crop, noise_mask)
 
-        callback = latent_preview.prepare_callback(model, steps)
+        window_start = 0 if start_step is None else start_step
+        window_end = steps if last_step is None else min(steps, last_step)
+        region_steps = max(0, window_end - window_start)
+        if preview_callback is None:
+            preview_callback = latent_preview.prepare_callback(model, region_steps)
+        if total_steps is None:
+            total_steps = region_steps
+        preview_canvas = None
+        preview_base = None
+
+        def callback(step, x0, x, _total_steps):
+            nonlocal preview_canvas, preview_base
+            if preview_canvas is None:
+                preview_canvas = model.get_model_object("process_latent_in")(source_primary).clone()
+                preview_base = preview_canvas[..., by0:by1, bx0:bx1].clone()
+            comp = self._reshape_mask_for_broadcast(spec["comp_lat"], preview_canvas.ndim)
+            preview_canvas[..., by0:by1, bx0:bx1] = primary_tensor(x0) * comp + preview_base * (1.0 - comp)
+            # Some samplers emit one more preview after the final diffusion step.
+            completed_steps = min(step + 1, region_steps)
+            preview_callback(step_offset + completed_steps - 1, preview_canvas, x, total_steps)
+            if preview_state is not None:
+                preview_state["step"] = completed_steps
+                preview_state.pop("mask", None)
+                send_status()
 
         try:
             samples = comfy.sample.sample(
                 model, noise, steps, cfg, sampler_name, scheduler,
                 spec["pos_cond"], spec["neg_cond"], latent_crop,
                 denoise=denoise, noise_mask=noise_mask,
+                disable_noise=disable_noise, start_step=start_step, last_step=last_step,
+                force_full_denoise=force_full_denoise,
                 callback=callback, disable_pbar=True, seed=spec["seed"],
             )
         except Exception as e:
+            if preview_state is not None:
+                preview_state["state"] = "stopped"
+                send_status()
             logging.error(
                 f"[FL_KsamplerSEG] region {spec['region_index']} sample failed: {e}"
             )
             raise
 
         return primary_tensor(samples)
+
+    @staticmethod
+    def _preview_mask(mask):
+        mask = mask.detach().float().cpu()
+        image = Image.fromarray((mask.clamp(0, 1).numpy() * 255).astype("uint8"))
+        image.thumbnail((160, 160))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
     @staticmethod
     def _cascade_order(*, regions, write_areas, start_corner):
@@ -344,48 +408,15 @@ class FL_KsamplerSEG:
 
     @staticmethod
     def _resolve_downscale(model, regions, latent_h, latent_w, image_h, image_w):
-        """Determine the actual spatial downscale ratio.
-
-        Order of preference:
-          1. The model's latent_format.spacial_downscale_ratio if it matches
-             the observed latent shape (this is the authoritative source --
-             SD/SDXL=8, Flux=8, LTX-Video=32, Hunyuan-Video=16, Wan=16, etc.)
-          2. Inferred from latent_shape / image_shape if (1) doesn't match
-          3. The regions dict's downscale_ratio hint as a final fallback
-        """
-        regions_hint = int(regions.get("downscale_ratio", 8))
-
-        # Try the model's authoritative value.
-        try:
-            latent_format = model.get_model_object("latent_format")
-            model_ratio = int(getattr(latent_format, "spacial_downscale_ratio", 8))
-            # Verify it matches the observed shape. Allow ±1 for rounding.
-            expected_lh = (image_h + model_ratio - 1) // model_ratio
-            expected_lw = (image_w + model_ratio - 1) // model_ratio
-            if abs(latent_h - expected_lh) <= 1 and abs(latent_w - expected_lw) <= 1:
-                if model_ratio != regions_hint:
-                    print(
-                        f"[FL_KsamplerSEG] model uses downscale={model_ratio} "
-                        f"(regions hint was {regions_hint}); using model's value."
-                    )
-                return model_ratio
-        except Exception:
-            pass
-
-        # Infer from observed shapes.
-        if latent_h > 0 and latent_w > 0:
-            inferred_h = round(image_h / latent_h)
-            inferred_w = round(image_w / latent_w)
-            if inferred_h == inferred_w and inferred_h >= 1:
-                if inferred_h != regions_hint:
-                    print(
-                        f"[FL_KsamplerSEG] inferred downscale={inferred_h} from "
-                        f"latent vs image dims (regions hint was {regions_hint})."
-                    )
-                return inferred_h
-
-        # Last resort.
-        return regions_hint
+        downscale = int(model.get_model_object("latent_format").spacial_downscale_ratio)
+        if not (image_h // downscale <= latent_h <= math.ceil(image_h / downscale)
+                and image_w // downscale <= latent_w <= math.ceil(image_w / downscale)):
+            raise ValueError(
+                f"SEG Regions describe {image_w}x{image_h}, but the latent represents "
+                f"{latent_w * downscale}x{latent_h * downscale}. "
+                "Connect Regions and VAE Encode to the same resized image."
+            )
+        return downscale
 
     @staticmethod
     def _reshape_mask_for_broadcast(mask_2d, target_ndim):
@@ -412,3 +443,35 @@ class FL_KsamplerSEG:
         pad_h = max(0, h - ch)
         pad_w = max(0, w - cw)
         return F.pad(t, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
+
+
+class FL_KsamplerSEGAdvanced(FL_KsamplerSEG):
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = super().INPUT_TYPES()
+        required = inputs["required"]
+        seed = required.pop("seed")
+        required.pop("denoise")
+        corner = required.pop("cascade_start_corner")
+        inputs["required"] = {
+            **{name: required[name] for name in ("model", "regions", "latent_image", "positive", "negative")},
+            "add_noise": (["enable", "disable"], {"default": "enable", "tooltip": "Enable for a source latent. Disable when continuing a latent that already contains noise."}),
+            "noise_seed": (seed[0], {**seed[1], "control_after_generate": True}),
+            **{name: required[name] for name in ("steps", "cfg", "sampler_name", "scheduler")},
+            "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "Start index in the full schedule, applied to every region. Zero starts at the beginning."}),
+            "end_at_step": ("INT", {"default": 10000, "min": 0, "max": 10000, "tooltip": "Stop index in the full schedule. Values above steps run to the end. An empty step window returns the input unchanged."}),
+            "return_with_leftover_noise": (["disable", "enable"], {"default": "disable", "tooltip": "Disable to finish at zero noise even when stopping early. Enable to retain noise for a following sampler."}),
+            "cascade_start_corner": corner,
+        }
+        return inputs
+
+    DESCRIPTION = "Sample each SEG region over an explicit window of the full diffusion schedule. Uses KSampler Advanced noise and end-step behavior. Overlapping regions are composited in cascade order, so splitting across nodes is not identical to one uninterrupted pass."
+
+    def sample(self, model, regions, latent_image, positive, negative, add_noise,
+               noise_seed, steps, cfg, sampler_name, scheduler, start_at_step,
+               end_at_step, return_with_leftover_noise, cascade_start_corner, unique_id=None):
+        return self._sample_regions(
+            model, regions, latent_image, positive, negative, noise_seed, steps, cfg,
+            sampler_name, scheduler, 1.0, cascade_start_corner, unique_id,
+            disable_noise=add_noise == "disable", start_step=start_at_step,
+            last_step=end_at_step, force_full_denoise=return_with_leftover_noise == "disable")

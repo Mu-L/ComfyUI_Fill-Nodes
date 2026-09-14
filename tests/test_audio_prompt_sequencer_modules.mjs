@@ -8,7 +8,9 @@ async function importModuleBody(filename, startMarker) {
   const source = await readFile(new URL(filename, AUDIO_NODE_URL), "utf8");
   const start = source.indexOf(startMarker);
   assert.notEqual(start, -1);
-  const encoded = Buffer.from(source.slice(start)).toString("base64");
+  const references = await readFile(new URL("audio_prompt_references.js", AUDIO_NODE_URL), "utf8");
+  const referenceHelpers = filename === "audio_prompt_sequencer_editor.js" ? references.slice(references.indexOf("export function ensureReferenceIds"), references.indexOf("export function mountReferences")) : "";
+  const encoded = Buffer.from(referenceHelpers + source.slice(start)).toString("base64");
   return import(`data:text/javascript;base64,${encoded}`);
 }
 
@@ -58,6 +60,37 @@ test("playhead draws reuse the static timeline layer", async () => {
 
   assert.equal(staticDraws, 1);
   assert.equal(playheadDraws, 2);
+});
+
+test("playback redraws update envelope indicators without rebuilding previews", async () => {
+  const module = await importModuleBody("audio_prompt_sequencer_editor.js", "const EPSILON");
+  const editor = Object.create(module.BeatPromptSequencer.prototype);
+  let callback;
+  let previewSyncs = 0;
+  const positions = [];
+  editor.pendingFrame = null;
+  editor.staticDirty = false;
+  editor.draw = () => { editor.staticDirty = false; };
+  editor.syncEnvelopePreviews = () => { previewSyncs++; editor.updateEnvelopePlayheads(); };
+  editor.updateEnvelopePlayheads = () => positions.push(editor.playheadFrame);
+  const previousRAF = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = fn => { callback = fn; return 1; };
+  try {
+    for (const frame of [12, 24, 0]) {
+      editor.playheadFrame = frame;
+      editor.scheduleDraw(false);
+      callback();
+    }
+    assert.deepEqual(positions, [12, 24, 0]);
+    assert.equal(previewSyncs, 0);
+    editor.scheduleDraw(false);
+    editor.scheduleDraw(true);
+    callback();
+    assert.equal(previewSyncs, 1);
+    assert.deepEqual(positions, [12, 24, 0, 0]);
+  } finally {
+    globalThis.requestAnimationFrame = previousRAF;
+  }
 });
 
 test("Writer activity animates one active box and clears completed boxes independently", async () => {
